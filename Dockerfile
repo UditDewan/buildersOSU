@@ -8,11 +8,27 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # Not built into the image; the manifest names it, so Cargo wants to see it.
 COPY ref ./ref
-# The crate has no dependencies, so the build needs nothing from the network.
+# The crate has no dependencies, so the build needs nothing from crates.io.
 # The scorers are Cascade Lake or newer: x86-64-v3 (AVX2, BMI2) is always there.
+#
+# Profile-guided optimization (BENCH.md, experiment 52): an instrumented build
+# runs once on a stand-in dataset from src/bin/synth.rs, and the shipped binary
+# is compiled with what it counted. Only how the code is laid out and which
+# paths the compiler favours change; what it computes cannot. `llvm-profdata`
+# comes from rustup's llvm-tools, which needs the network at build time.
 RUN set -eu; \
-    case "$(uname -m)" in x86_64) export RUSTFLAGS="-C target-cpu=x86-64-v3" ;; esac; \
-    cargo build --release --locked --offline --bin pipeline; \
+    FLAGS=""; \
+    case "$(uname -m)" in x86_64) FLAGS="-C target-cpu=x86-64-v3" ;; esac; \
+    rustup component add llvm-tools 2>/dev/null || rustup component add llvm-tools-preview; \
+    PROFDATA="$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -n 1)"; \
+    test -x "$PROFDATA"; \
+    cargo build --release --locked --offline --bin synth; \
+    target/release/synth --events 2000000 --clicks 500000 --seed 99 --output /tmp/train; \
+    RUSTFLAGS="$FLAGS -Cprofile-generate=/tmp/pgo" cargo build --release --locked --offline --bin pipeline --target-dir /tmp/instrumented; \
+    NCPU=4 /tmp/instrumented/release/pipeline /tmp/train /tmp/train-out; \
+    "$PROFDATA" merge -o /tmp/pgo.profdata /tmp/pgo; \
+    RUSTFLAGS="$FLAGS -Cprofile-use=/tmp/pgo.profdata" cargo build --release --locked --offline --bin pipeline; \
+    rm -rf /tmp/train /tmp/train-out /tmp/instrumented /tmp/pgo; \
     mkdir -p /rootfs/app /rootfs/data /rootfs/output /rootfs/scratch; \
     cp target/release/pipeline /rootfs/app/pipeline
 
