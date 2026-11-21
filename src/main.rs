@@ -691,7 +691,9 @@ impl Links {
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
             let (mask, t) = &self.0[hi as usize & (L - 1)];
-            _mm_prefetch::<_MM_HINT_T0>(t.as_ptr().add(lo as usize & mask) as *const i8);
+            let p = t.as_ptr().add(lo as usize & mask) as *const i8;
+            _mm_prefetch::<_MM_HINT_T0>(p);
+            _mm_prefetch::<_MM_HINT_T0>(p.add(64)); // a miss often probes into the next line
         }
     }
     #[inline]
@@ -975,11 +977,13 @@ fn main() {
                             });
                         },
                     );
-                    // ponytail: no prefetch here; clicks are a fifth of the rows
-                    for c in tmpc.iter_mut() {
-                        let (phi, plo) = links.person(c.phi, c.plo);
-                        c.phi = phi;
-                        c.plo = plo;
+                    for k in 0..tmpc.len() {
+                        if k + 16 < tmpc.len() {
+                            links.prefetch(tmpc[k + 16].phi, tmpc[k + 16].plo);
+                        }
+                        let (phi, plo) = links.person(tmpc[k].phi, tmpc[k].plo);
+                        tmpc[k].phi = phi;
+                        tmpc[k].plo = plo;
                     }
                     cpp.push(Parted::new(tmpc, nq, hist, |c| c.phi as usize & (nq - 1)));
                     return;
