@@ -15,20 +15,26 @@ COPY ref ./ref
 # runs once on a stand-in dataset from src/bin/synth.rs, and the shipped binary
 # is compiled with what it counted. Only how the code is laid out and which
 # paths the compiler favours change; what it computes cannot. `llvm-profdata`
-# comes from rustup's llvm-tools, which needs the network at build time.
+# comes from rustup's llvm-tools, which needs the network at build time; if
+# any step of it fails, the binary is built the plain way instead. (One `&&`
+# chain on purpose: `set -e` does not apply inside an `if` condition.)
 RUN set -eu; \
     FLAGS=""; \
     case "$(uname -m)" in x86_64) FLAGS="-C target-cpu=x86-64-v3" ;; esac; \
-    rustup component add llvm-tools 2>/dev/null || rustup component add llvm-tools-preview; \
-    PROFDATA="$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -n 1)"; \
-    test -x "$PROFDATA"; \
-    cargo build --release --locked --offline --bin synth; \
-    target/release/synth --events 2000000 --clicks 500000 --seed 99 --output /tmp/train; \
-    RUSTFLAGS="$FLAGS -Cprofile-generate=/tmp/pgo" cargo build --release --locked --offline --bin pipeline --target-dir /tmp/instrumented; \
-    NCPU=4 /tmp/instrumented/release/pipeline /tmp/train /tmp/train-out; \
-    "$PROFDATA" merge -o /tmp/pgo.profdata /tmp/pgo; \
-    RUSTFLAGS="$FLAGS -Cprofile-use=/tmp/pgo.profdata" cargo build --release --locked --offline --bin pipeline; \
-    rm -rf /tmp/train /tmp/train-out /tmp/instrumented /tmp/pgo; \
+    if { rustup component add llvm-tools 2>/dev/null || rustup component add llvm-tools-preview; } \
+        && PROFDATA="$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -n 1)" \
+        && test -x "$PROFDATA" \
+        && cargo build --release --locked --offline --bin synth \
+        && target/release/synth --events 2000000 --clicks 500000 --seed 99 --output /tmp/train \
+        && RUSTFLAGS="$FLAGS -Cprofile-generate=/tmp/pgo" cargo build --release --locked --offline --bin pipeline --target-dir /tmp/instrumented \
+        && NCPU=4 /tmp/instrumented/release/pipeline /tmp/train /tmp/train-out \
+        && "$PROFDATA" merge -o /tmp/pgo.profdata /tmp/pgo \
+        && RUSTFLAGS="$FLAGS -Cprofile-use=/tmp/pgo.profdata" cargo build --release --locked --offline --bin pipeline; \
+    then echo "pipeline: built with profile-guided optimization"; \
+    else echo "pipeline: the profile-guided build failed; building the plain way" >&2; \
+        RUSTFLAGS="$FLAGS" cargo build --release --locked --offline --bin pipeline; \
+    fi; \
+    rm -rf /tmp/train /tmp/train-out /tmp/instrumented /tmp/pgo /tmp/pgo.profdata; \
     mkdir -p /rootfs/app /rootfs/data /rootfs/output /rootfs/scratch; \
     cp target/release/pipeline /rootfs/app/pipeline
 
