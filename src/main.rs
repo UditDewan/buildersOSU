@@ -414,7 +414,7 @@ fn d2(s: &[u8], i: usize) -> Option<i64> {
     }
 }
 
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -423,6 +423,38 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe - 719468
 }
+
+// Calendar tables for years Y0..Y0+400 (others take the arithmetic path).
+const Y0: i64 = 1900;
+const fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+const LEAP: [bool; 400] = {
+    let mut t = [false; 400];
+    let mut i = 0;
+    while i < 400 {
+        t[i] = is_leap(Y0 + i as i64);
+        i += 1;
+    }
+    t
+};
+const YDAYS: [i64; 400] = {
+    let mut t = [0; 400];
+    let mut i = 0;
+    while i < 400 {
+        t[i] = days_from_civil(Y0 + i as i64, 1, 1);
+        i += 1;
+    }
+    t
+};
+const DIM: [[i64; 12]; 2] = [
+    [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
+    [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
+];
+const MCUM: [[i64; 12]; 2] = [
+    [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334],
+    [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335],
+];
 
 #[inline]
 fn parse_dt(s: &[u8]) -> Option<i64> {
@@ -433,6 +465,15 @@ fn parse_dt(s: &[u8]) -> Option<i64> {
     let (mo, d, h, mi, se) = (d2(s, 5)?, d2(s, 8)?, d2(s, 11)?, d2(s, 14)?, d2(s, 17)?);
     if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 {
         return None;
+    }
+    if (Y0..Y0 + 400).contains(&y) {
+        let yi = (y - Y0) as usize;
+        let lp = LEAP[yi] as usize;
+        if d > DIM[lp][mo as usize - 1] {
+            return None;
+        }
+        let days = YDAYS[yi] + MCUM[lp][mo as usize - 1] + d - 1;
+        return Some((days * 86400 + h * 3600 + mi * 60 + se) * 1000);
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
     let dim = [
@@ -511,10 +552,10 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 struct E1 {
     ehi: u64,
     elo: u64,
-    ingest: i64,
     uhi: u64,
     ulo: u64,
     uref: SRef,
+    ingest: i32, // seconds from window_start (ingest_ts is whole-second F1); only compared
     ts: u32,
     price: u32, // >0 only for a valid purchase
     cat: u16,
@@ -867,7 +908,10 @@ fn main() {
                             ehi,
                             elo,
                             ts: if valid { (t - cws) as u32 } else { 0 },
-                            ingest,
+                            // ponytail: saturates beyond +-68 years of the window, where no copy lives
+                            ingest: ((ingest.saturating_sub(ws)) / 1000)
+                                .clamp(i32::MIN as i64, i32::MAX as i64)
+                                as i32,
                             uref: if valid { sref(uid) } else { SRef(0) },
                             uhi,
                             ulo,
@@ -900,7 +944,7 @@ fn main() {
         nb,
         || {
             (
-                IdMap::<(u32, i64)>::default(),
+                IdMap::<(u32, i32)>::default(),
                 Vec::<bool>::new(),
                 Vec::<&E1>::new(),
                 Vec::<u32>::new(),
@@ -1306,6 +1350,32 @@ mod tests {
             assert_eq!(parse_ts(bad), None, "{}", String::from_utf8_lossy(bad));
         }
         assert!(parse_ts(b"2028-02-29T00:00:00Z").is_some());
+        for y in [
+            1899i64, 1900, 1999, 2000, 2025, 2028, 2100, 2299, 2300, 9999,
+        ] {
+            for m in 1..=12i64 {
+                for d in 1..=31i64 {
+                    let s = format!("{y:04}-{m:02}-{d:02}T01:02:03Z");
+                    let ok = d
+                        <= [
+                            31,
+                            if is_leap(y) { 29 } else { 28 },
+                            31,
+                            30,
+                            31,
+                            30,
+                            31,
+                            31,
+                            30,
+                            31,
+                            30,
+                            31,
+                        ][m as usize - 1];
+                    let want = ok.then(|| (days_from_civil(y, m, d) * 86400 + 3723) * 1000);
+                    assert_eq!(parse_ts(s.as_bytes()), want, "{s}");
+                }
+            }
+        }
         assert_eq!(parse_price(b"0250"), Some(250));
         assert_eq!(parse_price(b"10000001"), None);
         assert_eq!(parse_price(b"0"), None);
