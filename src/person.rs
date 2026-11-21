@@ -423,6 +423,35 @@ struct Few {
     earlier: [u32; FEW],
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn few_bounds(ts: &[u32; FEW], start: u32, earliest: u32) -> (usize, usize) {
+    use std::arch::x86_64::*;
+    const _: () = assert!(FEW == 16);
+    unsafe {
+        // Signed AVX2 comparisons become unsigned after flipping the sign bit.
+        let sign = _mm256_set1_epi32(i32::MIN);
+        let start = _mm256_set1_epi32((start ^ 0x8000_0000) as i32);
+        let earliest = _mm256_set1_epi32((earliest ^ 0x8000_0000) as i32);
+        let low = _mm256_xor_si256(_mm256_loadu_si256(ts.as_ptr() as *const __m256i), sign);
+        let high = _mm256_xor_si256(_mm256_loadu_si256(ts.as_ptr().add(8) as *const __m256i), sign);
+        let after = (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(low, start))) as u32)
+            | ((_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(high, start))) as u32) << 8);
+        let older = (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(earliest, low))) as u32)
+            | ((_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(earliest, high))) as u32) << 8);
+        (FEW - after.count_ones() as usize, older.count_ones() as usize)
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn few_bounds(ts: &[u32; FEW], start: u32, earliest: u32) -> (usize, usize) {
+    (
+        ts.iter().map(|&at| u32::from(at <= start)).sum::<u32>() as usize,
+        ts.iter().map(|&at| u32::from(at < earliest)).sum::<u32>() as usize,
+    )
+}
+
 /// Everything a thread accumulates while walking people.
 struct Tally {
     wide: Option<Vec<(u32, u32)>>,
@@ -558,8 +587,7 @@ impl Tally {
         let mut credited = self.organic;
         if count != 0 {
             let earliest = start.saturating_sub(REACH);
-            let upto = few.ts.iter().map(|&at| u32::from(at <= start)).sum::<u32>() as usize;
-            let oldest = few.ts.iter().map(|&at| u32::from(at < earliest)).sum::<u32>() as usize;
+            let (upto, oldest) = few_bounds(&few.ts, start, earliest);
             debug_assert!(oldest <= upto && upto <= count);
             unsafe {
                 credited = std::hint::select_unpredictable(upto > oldest, *few.campaign.get_unchecked(upto) as usize, self.organic);
@@ -761,4 +789,38 @@ pub fn run<R: Send>(
         sessions += s;
     }
     (cells, finished, sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn few_click_bounds_match_unsigned_definition() {
+        for start in [0, 1, REACH - 1, REACH, REACH + 1, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, u32::MAX - 1, u32::MAX] {
+            let earliest = start.saturating_sub(REACH);
+            let values = [0, earliest.saturating_sub(1), earliest, earliest.saturating_add(1), start.saturating_sub(1), start, start.saturating_add(1), u32::MAX - 1];
+            for count in 0..=FEW {
+                for &value in &values {
+                    let mut ts = [u32::MAX; FEW];
+                    ts[..count].fill(value);
+                    let expected = (
+                        ts.iter().filter(|&&at| at <= start).count(),
+                        ts.iter().filter(|&&at| at < earliest).count(),
+                    );
+                    assert_eq!(few_bounds(&ts, start, earliest), expected, "start {start}, count {count}, value {value}");
+                }
+                let mut ts = [u32::MAX; FEW];
+                for (at, slot) in ts[..count].iter_mut().enumerate() {
+                    *slot = values[(at * 5 + count) % values.len()];
+                }
+                ts[..count].sort_unstable();
+                let expected = (
+                    ts.iter().filter(|&&at| at <= start).count(),
+                    ts.iter().filter(|&&at| at < earliest).count(),
+                );
+                assert_eq!(few_bounds(&ts, start, earliest), expected, "mixed start {start}, count {count}");
+            }
+        }
+    }
 }
