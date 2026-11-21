@@ -230,7 +230,10 @@ impl Group {
         self.event_person.clear();
         self.event_person.reserve(event_count);
         self.bin_cursor.clear();
-        self.bin_cursor.resize(setup.bins + 1, 0);
+        // One cursor more than the bins need: a dropped record's (pass 2), which
+        // counts nothing and so starts at `live`, past every kept record.
+        self.bin_cursor.resize(setup.bins + 2, 0);
+        let spare = setup.bins + 1;
         // Pass 1: number the people, count events per person and per bin.
         let mut seen = 0;
         {
@@ -282,10 +285,12 @@ impl Group {
             total += n;
         }
         // Every slot of these three is written below, exactly once: no need to zero them first.
+        // The two staging arrays have room for the dropped records too, which pass 2
+        // writes past their ends and nothing reads.
         self.staged.clear();
-        self.staged.reserve(live);
+        self.staged.reserve(seen);
         self.staged_person.clear();
-        self.staged_person.reserve(live);
+        self.staged_person.reserve(seen);
         self.events.clear();
         self.events.reserve(live);
         unsafe {
@@ -306,14 +311,15 @@ impl Group {
                     for record in records {
                         let number = unsafe { *event_person.add(at) };
                         at += 1;
-                        if number != ABSENT {
-                            unsafe {
-                                let cursor = bin_cursor.add((record.ts / SESSION_GAP_MS) as usize);
-                                let place = *cursor;
-                                *staged.add(place as usize) = (u64::from(record.ts) << 32) | u64::from(record.purchase);
-                                *staged_person.add(place as usize) = number;
-                                *cursor = place + 1;
-                            }
+                        // A dropped record (one in sixteen, at random) goes to the spare
+                        // cursor instead of being branched around (BENCH.md, experiment 50).
+                        let bin = std::hint::select_unpredictable(number == ABSENT, spare, (record.ts / SESSION_GAP_MS) as usize);
+                        unsafe {
+                            let cursor = bin_cursor.add(bin);
+                            let place = *cursor;
+                            *staged.add(place as usize) = (u64::from(record.ts) << 32) | u64::from(record.purchase);
+                            *staged_person.add(place as usize) = number;
+                            *cursor = place + 1;
                         }
                     }
                 }
