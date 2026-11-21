@@ -1,23 +1,31 @@
-# Shopping Sessions: a single Rust binary. Build is untimed; the run is the binary alone.
-FROM rust:1.87-bookworm AS build
+# Shopping Sessions: a single static binary, built from source.
+# No FROM line pins a platform: the scorer builds this natively on linux/amd64,
+# and `make build PLATFORM=linux/arm64` builds it natively on an Apple-silicon Mac.
+
+FROM rust:1.100-alpine3.22 AS build
 WORKDIR /src
-# Profile-guided optimization: train on a dataset from the organizers' generator (build time only).
-COPY pgo ./pgo
-RUN cd pgo/generator && cargo build --release -q \
- && ./target/release/generate --seed 99 --events 2000000 --clicks 500000 --output /train
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# x86-64-v3 (AVX2) runs on any Cascade Lake scorer; memchr picks wider SIMD at run time.
-ENV FLAGS="-C target-cpu=x86-64-v3"
-# Any PGO step failing falls back to a plain optimized build.
-RUN ( rustup component add llvm-tools-preview \
-   && RUSTFLAGS="$FLAGS -Cprofile-generate=/tmp/pgo" cargo build --release --locked --target-dir /tmp/tgen \
-   && DATA_DIR=/train OUTPUT_DIR=/tmp/out NCPU=4 /tmp/tgen/release/sessions \
-   && "$(find / -name llvm-profdata -type f 2>/dev/null | head -1)" merge -o /tmp/pgo.profdata /tmp/pgo \
-   && RUSTFLAGS="$FLAGS -Cprofile-use=/tmp/pgo.profdata" cargo build --release --locked \
-   ) || RUSTFLAGS="$FLAGS" cargo build --release --locked
+# Not built into the image; the manifest names it, so Cargo wants to see it.
+COPY ref ./ref
+# The crate has no dependencies, so the build needs nothing from the network.
+# The scorers are Cascade Lake or newer: x86-64-v3 (AVX2, BMI2) is always there.
+RUN set -eu; \
+    case "$(uname -m)" in x86_64) export RUSTFLAGS="-C target-cpu=x86-64-v3" ;; esac; \
+    cargo build --release --locked --offline --bin pipeline; \
+    mkdir -p /rootfs/app /rootfs/data /rootfs/output /rootfs/scratch; \
+    cp target/release/pipeline /rootfs/app/pipeline
 
-FROM debian:bookworm-slim
-COPY --from=build /src/target/release/sessions /usr/local/bin/sessions
-USER 1000:1000
-CMD ["/usr/local/bin/sessions"]
+# At run time the root filesystem is read-only, the user is 1000:1000 and there
+# is no network. The binary is static and writes only to $OUTPUT_DIR.
+#
+# The runtime image is as small as an image with a shell can be (2 MB): if a
+# sandbox is unpacked from the image for every run, its size is paid on every
+# run. BusyBox rather than scratch so that a harness that runs `sh` or `chmod`
+# inside the image still can; the pipeline itself needs neither, and creates
+# its output readable, writable and removable by anyone.
+FROM busybox:1.37-musl
+# One layer: the binary, and the mount points should the sandbox not create them.
+COPY --from=build /rootfs/ /
+WORKDIR /app
+CMD ["/app/pipeline"]

@@ -1,1 +1,12 @@
-target/
+/target/
+/dev/
+/dev-answer/
+/out/
+/data/
+/.tools/
+/.venv/
+*.parquet
+.DS_Store
+__pycache__/
+*.pyc
+logs/
