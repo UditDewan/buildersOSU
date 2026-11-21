@@ -61,13 +61,49 @@ fn h128(s: &[u8]) -> (u64, u64) {
 }
 
 /// Invertible: xor-shifts right and multiplications by odd constants are bijections on u128.
+const K1: u128 = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835;
+const K2: u128 = 0xD6E8_FEB8_6659_FD93_A5A3_5625_3AD5_B9C7;
 #[inline]
 fn mix128(mut x: u128) -> u128 {
     x ^= x >> 67;
-    x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835);
+    x = x.wrapping_mul(K1);
     x ^= x >> 59;
-    x = x.wrapping_mul(0xD6E8_FEB8_6659_FD93_A5A3_5625_3AD5_B9C7);
+    x = x.wrapping_mul(K2);
     x ^ x >> 64
+}
+/// Inverse of an odd number mod 2^128 (Newton's iteration doubles the correct bits each step).
+const fn inv128(k: u128) -> u128 {
+    let mut x = k;
+    let mut i = 0;
+    while i < 7 {
+        x = x.wrapping_mul(2u128.wrapping_sub(k.wrapping_mul(x)));
+        i += 1;
+    }
+    x
+}
+fn unmix128(mut x: u128) -> u128 {
+    x ^= x >> 64;
+    x = x.wrapping_mul(inv128(K2));
+    x ^= x >> 59 ^ x >> 118;
+    x = x.wrapping_mul(inv128(K1));
+    x ^ x >> 67
+}
+/// The ID behind a person key: decoded when it is up to 15 bytes, else from `long`.
+fn name_of(
+    hi: u64,
+    lo: u64,
+    long: &FxHashMap<u128, SRef>,
+    arena: &mut Vec<u8>,
+) -> Result<(usize, usize), &'static [u8]> {
+    let raw = unmix128(key(hi, lo));
+    let len = (raw >> 120) as usize;
+    if len <= 15 {
+        let at = arena.len();
+        arena.extend_from_slice(&raw.to_le_bytes()[..len]);
+        Ok((at, len))
+    } else {
+        Err(long[&key(hi, lo)].get())
+    }
 }
 
 /// Hasher for keys that are already random hashes.
@@ -588,7 +624,6 @@ struct E1 {
 struct E2 {
     phi: u64,
     plo: u64,
-    nref: SRef,
     ts: u32,
     price: u32,
     cat: u16,
@@ -614,7 +649,8 @@ impl C2 {
     }
 }
 struct URow {
-    nref: SRef,
+    phi: u64,
+    plo: u64,
     day: i32,
     sessions: u32,
     events: u32,
@@ -622,17 +658,16 @@ struct URow {
     top: u16, // u16::MAX = null
 }
 
-type Person = (u64, u64, SRef);
+type Person = (u64, u64);
 #[derive(Clone, Copy, Default)]
 struct Slot {
     hi: u64,
     lo: u64, // hi = lo = 0 marks an empty slot: only the empty ID hashes to it, and those are dropped
     phi: u64,
     plo: u64,
-    pref: SRef,
 }
 /// Linked IDs -> person, as L flat linear-probing tables picked by `hi`, indexed by `lo`.
-struct Links(Vec<(usize, Vec<Slot>)>);
+struct Links(Vec<(usize, Vec<Slot>)>, Vec<(u64, u64, SRef)>); // tables; person names over 15 bytes
 impl Links {
     #[inline]
     fn prefetch(&self, hi: u64, lo: u64) {
@@ -644,16 +679,16 @@ impl Links {
         }
     }
     #[inline]
-    fn person(&self, hi: u64, lo: u64, r: SRef) -> Person {
+    fn person(&self, hi: u64, lo: u64) -> Person {
         let (mask, t) = &self.0[hi as usize & (L - 1)];
         let mut i = lo as usize & mask;
         loop {
             let s = &t[i];
             if s.hi == hi && s.lo == lo {
-                return (s.phi, s.plo, s.pref);
+                return (s.phi, s.plo);
             }
             if s.hi == 0 && s.lo == 0 {
-                return (hi, lo, r);
+                return (hi, lo);
             }
             i = (i + 1) & mask;
         }
@@ -738,7 +773,6 @@ fn build_links(nt: usize, dir: &Path) -> Links {
                     lo,
                     phi: hs[b].0,
                     plo: hs[b].1,
-                    pref: refs[b],
                 };
             }
             v.push((u, (mask, t)));
@@ -749,7 +783,14 @@ fn build_links(nt: usize, dir: &Path) -> Links {
     .collect::<std::collections::BTreeMap<_, _>>()
     .into_values()
     .collect();
-    Links(tables)
+    let long = (0..n)
+        .filter(|&i| root[i] as usize == i && refs[best[i] as usize].get().len() > 15)
+        .map(|i| {
+            let b = best[i] as usize;
+            (hs[b].0, hs[b].1, refs[b])
+        })
+        .collect();
+    Links(tables, long)
 }
 
 fn json_field(s: &str, name: &str) -> i64 {
@@ -880,7 +921,7 @@ fn main() {
                     );
                     // ponytail: no prefetch here; clicks are a fifth of the rows
                     for c in tmpc.iter_mut() {
-                        let (phi, plo, _) = links.person(c.phi, c.plo, SRef(0));
+                        let (phi, plo) = links.person(c.phi, c.plo);
                         c.phi = phi;
                         c.plo = plo;
                     }
@@ -970,11 +1011,15 @@ fn main() {
                 Vec::<bool>::new(),
                 Vec::<&E1>::new(),
                 Vec::<u32>::new(),
-                (Vec::<E2>::new(), Vec::<u32>::new()),
+                (
+                    Vec::<E2>::new(),
+                    Vec::<u32>::new(),
+                    Vec::<(u64, u64, SRef)>::new(),
+                ),
                 Vec::<Parted<E2>>::new(),
             )
         },
-        |(best, dead, all, surv, (te, hist), eo), bi| {
+        |(best, dead, all, surv, (te, hist, longs), eo), bi| {
             te.clear();
             for p in bi * per..((bi + 1) * per).min(np) {
                 all.clear();
@@ -1012,12 +1057,14 @@ fn main() {
                         links.prefetch(r.uhi, r.ulo);
                     }
                     let r = all[surv[k] as usize];
-                    let (phi, plo, nref) = links.person(r.uhi, r.ulo, r.uref);
+                    let (phi, plo) = links.person(r.uhi, r.ulo);
+                    if r.uref.get().len() > 15 {
+                        longs.push((r.uhi, r.ulo, r.uref)); // an unlinked person's long name
+                    }
                     te.push(E2 {
                         phi,
                         plo,
                         ts: r.ts,
-                        nref,
                         price: r.price,
                         cat: r.cat,
                     });
@@ -1027,7 +1074,9 @@ fn main() {
         },
     );
     let mut ep = Vec::new();
+    let mut long: FxHashMap<u128, SRef> = links.1.iter().map(|&(h, l, r)| (key(h, l), r)).collect();
     for st in s2 {
+        long.extend(st.4 .2.iter().map(|&(h, l, r)| (key(h, l), r)));
         ep.extend(st.5);
     }
     log("deduped, mapped to persons");
@@ -1075,7 +1124,6 @@ fn main() {
                 }
                 let evs = &ev[a..b];
                 let cks = &ck[c..d];
-                let nref = evs[0].nref;
                 // sessions + user_daily
                 starts.clear();
                 sdays.clear();
@@ -1131,7 +1179,8 @@ fn main() {
                         }
                         _ => {
                             day_row = Some(URow {
-                                nref,
+                                phi,
+                                plo,
                                 day: eday as i32,
                                 sessions: 1,
                                 events: (j - i) as u32,
@@ -1236,6 +1285,7 @@ fn main() {
                 &out.join(format!("user_daily/part-{i}.parquet")),
                 &s3[i].1,
                 &cats,
+                &long,
             );
         },
     );
@@ -1276,14 +1326,23 @@ fn write_table(path: &Path, schema: &str, mut cols: Vec<Col<'_>>) {
     w.close().unwrap();
 }
 
-fn write_user(path: &Path, rows: &[URow], cats: &[&'static [u8]]) {
+fn write_user(path: &Path, rows: &[URow], cats: &[&'static [u8]], long: &FxHashMap<u128, SRef>) {
     let cats: Vec<&'static [u8]> = cats.to_vec();
     write_table(
         path,
         "message s { required binary user_id (UTF8); required int32 day (DATE); required int32 sessions; required int32 events; required int64 revenue_cents; optional binary top_category (UTF8); }",
         vec![
             Box::new(|c| {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ba(r.nref.get())).collect();
+                let mut arena = Vec::with_capacity(rows.len() * 12);
+                let spans: Vec<_> = rows.iter().map(|r| name_of(r.phi, r.plo, long, &mut arena)).collect();
+                let arena = bytes::Bytes::from(arena);
+                let v: Vec<ByteArray> = spans
+                    .into_iter()
+                    .map(|n| match n {
+                        Ok((at, len)) => ByteArray::from(arena.slice(at..at + len)),
+                        Err(s) => ba(s),
+                    })
+                    .collect();
                 c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
             }),
             Box::new(|c| {
@@ -1372,6 +1431,18 @@ mod tests {
             assert_eq!(parse_ts(bad), None, "{}", String::from_utf8_lossy(bad));
         }
         assert!(parse_ts(b"2028-02-29T00:00:00Z").is_some());
+        let mut x: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+        for _ in 0..1000 {
+            assert_eq!(unmix128(mix128(x)), x);
+            x = x.wrapping_mul(K1).wrapping_add(12345);
+        }
+        let none = FxHashMap::default();
+        for id in [&b"u1"[..], b"uduffvac", b"A	B", b"exactly15bytes!", b""] {
+            let (h, l) = h128(id);
+            let mut arena = Vec::new();
+            let (at, len) = name_of(h, l, &none, &mut arena).unwrap();
+            assert_eq!(&arena[at..at + len], id);
+        }
         for y in [
             1899i64, 1900, 1999, 2000, 2025, 2028, 2100, 2299, 2300, 9999,
         ] {
