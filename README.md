@@ -15,6 +15,10 @@ The Dockerfile builds it; the image's `CMD` reads `/data` and writes `/output/us
 
 IDs are compared through a 128-bit bijection of their bytes, so IDs of up to 15 bytes (all the generator writes) can never collide; longer ones fall back to xxh3-128. Byte order is used wherever the rules need it: person names and `click_id` ties.
 
+## Build
+
+The Dockerfile uses profile-guided optimization. It builds the organizers' dataset generator (vendored, unchanged, in `pgo/generator/`), generates a 2M-event training set with a seed of its own, runs an instrumented build on it, and compiles the final binary with that profile. If any of those steps fails, it falls back to a plain optimized build. All of this happens at build time; the run is the binary alone.
+
 ## Verify
 
 ```sh
