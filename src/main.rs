@@ -60,6 +60,20 @@ fn h128(s: &[u8]) -> (u64, u64) {
     ((h >> 64) as u64, h as u64)
 }
 
+/// h128 of a field inside an input mapping, without the copy: every input file starts with a
+/// header line of at least 16 bytes (checked in `chunks`), so the 16 bytes ending at a data
+/// field's end are always mapped. Same result as h128.
+#[inline]
+fn h128_mapped(s: &[u8]) -> (u64, u64) {
+    let n = s.len();
+    if n == 0 || n > 15 {
+        return h128(s);
+    }
+    let v = unsafe { std::ptr::read_unaligned(s.as_ptr().add(n).sub(16) as *const u128) };
+    let h = mix128(u128::from_le(v) >> ((16 - n) * 8) | (n as u128) << 120);
+    ((h >> 64) as u64, h as u64)
+}
+
 /// Invertible: xor-shifts right and multiplications by odd constants are bijections on u128.
 const K1: u128 = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835;
 const K2: u128 = 0xD6E8_FEB8_6659_FD93_A5A3_5625_3AD5_B9C7;
@@ -435,6 +449,7 @@ fn chunks(dir: &Path, nt: usize) -> Vec<&'static [u8]> {
         let Some(h) = memchr::memchr(b'\n', d) else {
             continue;
         };
+        assert!(h >= 16, "header too short for h128_mapped"); // the rules fix every header at 19+ bytes
         let mut s = h + 1;
         while s < d.len() {
             let mut e = (s + chunk).min(d.len());
@@ -703,8 +718,8 @@ fn build_links(nt: usize, dir: &Path) -> Links {
         |v: &mut Vec<(SRef, u64, u64, SRef, u64, u64)>, i| {
             for_records(ch[i], |[a, b]: [&'static [u8]; 2]| {
                 if !a.is_empty() && !b.is_empty() {
-                    let (ah, al) = h128(a);
-                    let (bh, bl) = h128(b);
+                    let (ah, al) = h128_mapped(a);
+                    let (bh, bl) = h128_mapped(b);
                     v.push((sref(a), ah, al, sref(b), bh, bl));
                 }
             })
@@ -909,7 +924,7 @@ fn main() {
                                 return;
                             };
                             let Some(&c) = camp.get(cp) else { return };
-                            let (h, lo) = h128(uid);
+                            let (h, lo) = h128_mapped(uid);
                             tmpc.push(C2 {
                                 phi: h,
                                 plo: lo,
@@ -965,8 +980,8 @@ fn main() {
                         if valid && ingest - t > DAY {
                             valid = false;
                         }
-                        let (ehi, elo) = h128(eid);
-                        let (uhi, ulo) = if valid { h128(uid) } else { (0, 0) };
+                        let (ehi, elo) = h128_mapped(eid);
+                        let (uhi, ulo) = if valid { h128_mapped(uid) } else { (0, 0) };
                         if valid && uid.len() > 15 {
                             longs.push((uhi, ulo, sref(uid))); // may name an unlinked person
                         }
@@ -1435,6 +1450,12 @@ mod tests {
         for _ in 0..1000 {
             assert_eq!(unmix128(mix128(x)), x);
             x = x.wrapping_mul(K1).wrapping_add(12345);
+        }
+        let buf: Vec<u8> = (0..200u32).map(|i| (i * 37 % 251) as u8).collect();
+        for st in 16..100 {
+            for n in 0..40 {
+                assert_eq!(h128_mapped(&buf[st..st + n]), h128(&buf[st..st + n]));
+            }
         }
         let none = FxHashMap::default();
         for id in [&b"u1"[..], b"uduffvac", b"A	B", b"exactly15bytes!", b""] {
