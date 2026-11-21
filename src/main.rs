@@ -1369,6 +1369,7 @@ fn write_table(path: &Path, schema: &str, mut cols: Vec<Col<'_>>) {
     let props = Arc::new(
         WriterProperties::builder()
             .set_dictionary_enabled(false)
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
             .build(),
     );
     let f = std::fs::File::create(path).unwrap();
