@@ -612,7 +612,6 @@ struct E1 {
     elo: u64,
     uhi: u64,
     ulo: u64,
-    uref: SRef,
     ingest: i32, // seconds from window_start (ingest_ts is whole-second F1); only compared
     ts: u32,
     price: u32, // >0 only for a valid purchase
@@ -892,9 +891,10 @@ fn main() {
                     Vec::<u32>::new(),
                     Vec::<Parted<E1>>::new(),
                     Vec::<Parted<C2>>::new(),
+                    Vec::<(u64, u64, SRef)>::new(),
                 )
             },
-            |(tmp, tmpc, hist, evp, cpp), i| {
+            |(tmp, tmpc, hist, evp, cpp, longs), i| {
                 if i >= ne {
                     // click chunks come last; links are long done by then
                     let links = links_cell.wait();
@@ -967,6 +967,9 @@ fn main() {
                         }
                         let (ehi, elo) = h128(eid);
                         let (uhi, ulo) = if valid { h128(uid) } else { (0, 0) };
+                        if valid && uid.len() > 15 {
+                            longs.push((uhi, ulo, sref(uid))); // may name an unlinked person
+                        }
                         tmp.push(E1 {
                             ehi,
                             elo,
@@ -975,7 +978,6 @@ fn main() {
                             ingest: ((ingest.saturating_sub(ws)) / 1000)
                                 .clamp(i32::MIN as i64, i32::MAX as i64)
                                 as i32,
-                            uref: if valid { sref(uid) } else { SRef(0) },
                             uhi,
                             ulo,
                             price: p,
@@ -989,10 +991,11 @@ fn main() {
         )
     });
     let links = links_cell.into_inner().unwrap();
-    let (mut evp, mut cp) = (Vec::new(), Vec::new());
+    let (mut evp, mut cp, mut longs) = (Vec::new(), Vec::new(), Vec::new());
     for st in s1 {
         evp.extend(st.3);
         cp.extend(st.4);
+        longs.extend(st.5);
     }
     log("parsed, links built");
 
@@ -1011,15 +1014,11 @@ fn main() {
                 Vec::<bool>::new(),
                 Vec::<&E1>::new(),
                 Vec::<u32>::new(),
-                (
-                    Vec::<E2>::new(),
-                    Vec::<u32>::new(),
-                    Vec::<(u64, u64, SRef)>::new(),
-                ),
+                (Vec::<E2>::new(), Vec::<u32>::new()),
                 Vec::<Parted<E2>>::new(),
             )
         },
-        |(best, dead, all, surv, (te, hist, longs), eo), bi| {
+        |(best, dead, all, surv, (te, hist), eo), bi| {
             te.clear();
             for p in bi * per..((bi + 1) * per).min(np) {
                 all.clear();
@@ -1058,9 +1057,6 @@ fn main() {
                     }
                     let r = all[surv[k] as usize];
                     let (phi, plo) = links.person(r.uhi, r.ulo);
-                    if r.uref.get().len() > 15 {
-                        longs.push((r.uhi, r.ulo, r.uref)); // an unlinked person's long name
-                    }
                     te.push(E2 {
                         phi,
                         plo,
@@ -1074,9 +1070,13 @@ fn main() {
         },
     );
     let mut ep = Vec::new();
-    let mut long: FxHashMap<u128, SRef> = links.1.iter().map(|&(h, l, r)| (key(h, l), r)).collect();
+    let long: FxHashMap<u128, SRef> = links
+        .1
+        .iter()
+        .chain(&longs)
+        .map(|&(h, l, r)| (key(h, l), r))
+        .collect();
     for st in s2 {
-        long.extend(st.4 .2.iter().map(|&(h, l, r)| (key(h, l), r)));
         ep.extend(st.5);
     }
     log("deduped, mapped to persons");
