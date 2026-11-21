@@ -191,14 +191,16 @@ fn group<'a, T: Copy + Default + 'a>(
         hist[i] += hist[i - 1];
     }
     out.clear();
-    out.resize(n, T::default());
+    out.reserve(n);
+    let ptr = out.as_mut_ptr();
     for s in src {
         for x in s {
             let b = (key(x).0 >> shift) as usize;
-            out[hist[b] as usize] = *x;
+            unsafe { ptr.add(hist[b] as usize).write(*x) };
             hist[b] += 1;
         }
     }
+    unsafe { out.set_len(n) }; // every slot written: the counts sum to n
     // hist[b] is now the end of bucket b
     let mut st = 0;
     for b in 0..hist.len() - 1 {
