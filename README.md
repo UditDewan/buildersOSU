@@ -13,7 +13,7 @@ The Dockerfile builds it; the image's `CMD` reads `/data` and writes `/output/us
 6. **Sessions** are built per person partition: radix-group by person, then sessionize, credit the latest click within 7 days (ties go to the smallest `click_id`), count assists over merged 7-day click intervals, and aggregate both tables.
 7. **Write.** Uncompressed Parquet, one file per thread.
 
-IDs are compared by their xxh3-128 hash, so a collision is a ~1e-20 event at 60M rows. Byte order is used wherever the rules need it: person names and `click_id` ties.
+IDs are compared through a 128-bit bijection of their bytes, so IDs of up to 15 bytes (all the generator writes) can never collide; longer ones fall back to xxh3-128. Byte order is used wherever the rules need it: person names and `click_id` ties.
 
 ## Verify
 

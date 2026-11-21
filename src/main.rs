@@ -2,7 +2,7 @@
 //! links -> union-find; events parsed into eid-partitions -> dedup/validate ->
 //! person-partitions; clicks parsed straight into person-partitions; then each
 //! person-partition is sorted, sessionized, attributed and aggregated.
-//! IDs are identified by xxh3-128 hashes (collision odds ~1e-20 at 60M rows);
+//! IDs are identified by a 128-bit bijection of their bytes (exact up to 15 bytes; xxh3-128 beyond);
 //! the one byte-order comparison the rules need (click_id ties, person names)
 //! uses the original bytes.
 
@@ -42,10 +42,32 @@ impl SRef {
     }
 }
 
+/// 128-bit ID identity. IDs of up to 15 bytes (all the generator writes) are packed with their
+/// length and put through a bijection, so distinct IDs never collide; longer IDs use xxh3-128
+/// with the length byte set to 0xFF, keeping the two kinds disjoint. The bijection also mixes
+/// the bits, so any slice of the result works as a partition or table index.
 #[inline]
 fn h128(s: &[u8]) -> (u64, u64) {
-    let h = xxhash_rust::xxh3::xxh3_128(s);
+    let x = if s.len() <= 15 {
+        let mut b = [0u8; 16];
+        b[..s.len()].copy_from_slice(s);
+        b[15] = s.len() as u8;
+        u128::from_le_bytes(b)
+    } else {
+        xxhash_rust::xxh3::xxh3_128(s) | 0xFF << 120
+    };
+    let h = mix128(x);
     ((h >> 64) as u64, h as u64)
+}
+
+/// Invertible: xor-shifts right and multiplications by odd constants are bijections on u128.
+#[inline]
+fn mix128(mut x: u128) -> u128 {
+    x ^= x >> 67;
+    x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835);
+    x ^= x >> 59;
+    x = x.wrapping_mul(0xD6E8_FEB8_6659_FD93_A5A3_5625_3AD5_B9C7);
+    x ^ x >> 64
 }
 
 /// Hasher for keys that are already random hashes.
@@ -604,7 +626,7 @@ type Person = (u64, u64, SRef);
 #[derive(Clone, Copy, Default)]
 struct Slot {
     hi: u64,
-    lo: u64, // hi = lo = 0 marks an empty slot (an xxh3-128 of 0 is a 2^-128 event)
+    lo: u64, // hi = lo = 0 marks an empty slot: only the empty ID hashes to it, and those are dropped
     phi: u64,
     plo: u64,
     pref: SRef,
