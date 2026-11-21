@@ -1,10 +1,4 @@
-# Shopping Sessions
 
-This checkout imports [Vibhor7-7/shopping-sessions](https://github.com/Vibhor7-7/shopping-sessions) at commit `604f10b4a08960c987e84aecfb1cee30e19ea30b`. The runtime code is unchanged. `BENCH.md` and `SUBMISSIONS.md` record historical runs of that source; this checkout has not been scored. The previous `buildersOSU` checkout's `pgo/generator/` and `scripts/reference.py` remain available for development, but the Docker build does not include them.
-
-A hand-written pipeline for the Shopping Sessions track: dirty event, click and link CSVs in, two exact daily Parquet tables out. `rules.md` is the specification.
-
-It is one static Rust binary with no dependencies. The CSV dialect in `rules.md` does not match any engine's reader (a `\r` is data, every comma splits, a quote is only legal around a whole field), so the parser is written to the rules instead of bending a general one to them.
 
 ## Run it
 
