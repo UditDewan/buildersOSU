@@ -22,12 +22,14 @@ const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const P: usize = 512; // eid partitions
 const Q: usize = 512; // person partitions
+static T_A: AtomicUsize = AtomicUsize::new(0);
+static T_B: AtomicUsize = AtomicUsize::new(0);
 const CHUNK: usize = 4 << 20;
 
 // ---------- small utilities ----------
 
 /// A &'static [u8] packed into 8 bytes: pointer in the low 48 bits, length in the high 16.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct SRef(u64);
 fn sref(s: &'static [u8]) -> SRef {
     // ponytail: IDs over 64 KiB abort; the generator writes ~10-byte IDs.
@@ -92,6 +94,74 @@ fn par<T: Send>(nt: usize, n: usize, init: impl Fn() -> T + Sync, work: impl Fn(
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
+}
+
+/// Concatenates `src` into `out` sorted by `key` (whose first part is a random hash): one
+/// counting-sort pass on its top bits, then tiny sorts per bucket.
+fn group<'a, T: Copy + Default + 'a>(src: impl Iterator<Item = &'a [T]> + Clone, out: &mut Vec<T>, hist: &mut Vec<u32>, key: impl Fn(&T) -> (u64, u64, i64)) {
+    let n: usize = src.clone().map(|s| s.len()).sum();
+    let bits = (usize::BITS - n.max(2).leading_zeros()).clamp(4, 22);
+    let shift = 64 - bits;
+    hist.clear();
+    hist.resize((1 << bits) + 1, 0);
+    for s in src.clone() {
+        for x in s {
+            hist[(key(x).0 >> shift) as usize + 1] += 1;
+        }
+    }
+    for i in 1..hist.len() {
+        hist[i] += hist[i - 1];
+    }
+    out.clear();
+    out.resize(n, T::default());
+    for s in src {
+        for x in s {
+            let b = (key(x).0 >> shift) as usize;
+            out[hist[b] as usize] = *x;
+            hist[b] += 1;
+        }
+    }
+    // hist[b] is now the end of bucket b
+    let mut st = 0;
+    for b in 0..hist.len() - 1 {
+        let e = hist[b] as usize;
+        if e - st > 1 {
+            out[st..e].sort_unstable_by_key(&key);
+        }
+        st = e;
+    }
+}
+
+/// Records counting-sorted into partitions, in one exact-size buffer.
+struct Parted<T> {
+    data: Vec<T>,
+    off: Vec<u32>,
+}
+impl<T: Copy> Parted<T> {
+    fn new(src: &[T], np: usize, hist: &mut Vec<u32>, part: impl Fn(&T) -> usize) -> Self {
+        hist.clear();
+        hist.resize(np + 1, 0);
+        for x in src {
+            hist[part(x) + 1] += 1;
+        }
+        for i in 1..=np {
+            hist[i] += hist[i - 1];
+        }
+        let off = hist.clone();
+        let mut data: Vec<T> = Vec::with_capacity(src.len());
+        let ptr = data.as_mut_ptr();
+        for x in src {
+            let b = part(x);
+            unsafe { ptr.add(hist[b] as usize).write(*x) };
+            hist[b] += 1;
+        }
+        unsafe { data.set_len(src.len()) }; // every slot written: the counts sum to src.len()
+        Parted { data, off }
+    }
+    #[inline]
+    fn get(&self, p: usize) -> &[T] {
+        &self.data[self.off[p] as usize..self.off[p + 1] as usize]
+    }
 }
 
 // ---------- CSV ----------
@@ -297,6 +367,7 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 
 // ---------- records ----------
 
+#[derive(Clone, Copy)]
 struct E1 {
     ehi: u64,
     elo: u64,
@@ -309,7 +380,7 @@ struct E1 {
     cat: u16,
     valid: bool,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct E2 {
     phi: u64,
     plo: u64,
@@ -318,7 +389,7 @@ struct E2 {
     price: u32,
     cat: u16,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct C2 {
     phi: u64,
     plo: u64,
@@ -336,14 +407,39 @@ struct URow {
 }
 
 type Person = (u64, u64, SRef);
-/// Linked IDs, partitioned like the person partitions (uid hi & (Q-1)), so each lookup stays cache-local.
-struct Links(Vec<IdMap<Person>>);
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    hi: u64,
+    lo: u64, // hi = lo = 0 marks an empty slot (an xxh3-128 of 0 is a 2^-128 event)
+    phi: u64,
+    plo: u64,
+    pref: SRef,
+}
+/// Linked IDs -> person, as Q flat linear-probing tables picked by `hi`, indexed by `lo`.
+struct Links(Vec<(usize, Vec<Slot>)>);
 impl Links {
     #[inline]
+    fn prefetch(&self, hi: u64, lo: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let (mask, t) = &self.0[hi as usize & (Q - 1)];
+            _mm_prefetch::<_MM_HINT_T0>(t.as_ptr().add(lo as usize & mask) as *const i8);
+        }
+    }
+    #[inline]
     fn person(&self, hi: u64, lo: u64, r: SRef) -> Person {
-        match self.0[hi as usize & (Q - 1)].get(&key(hi, lo)) {
-            Some(&p) => p,
-            None => (hi, lo, r),
+        let (mask, t) = &self.0[hi as usize & (Q - 1)];
+        let mut i = lo as usize & mask;
+        loop {
+            let s = &t[i];
+            if s.hi == hi && s.lo == lo {
+                return (s.phi, s.plo, s.pref);
+            }
+            if s.hi == 0 && s.lo == 0 {
+                return (hi, lo, r);
+            }
+            i = (i + 1) & mask;
         }
     }
 }
@@ -401,22 +497,27 @@ fn build_links(nt: usize, dir: &Path) -> Links {
             best[r] = i as u32;
         }
     }
-    let maps: Vec<IdMap<Person>> = par(nt, Q, Vec::new, |v: &mut Vec<(usize, IdMap<Person>)>, u| {
-        let m = maps[u]
-            .iter()
-            .map(|(&k, &i)| {
-                let b = best[root[i as usize] as usize] as usize;
-                (k, (hs[b].0, hs[b].1, refs[b]))
-            })
-            .collect();
-        v.push((u, m));
+    let tables: Vec<(usize, Vec<Slot>)> = par(nt, Q, Vec::new, |v: &mut Vec<(usize, (usize, Vec<Slot>))>, u| {
+        let cap = (maps[u].len() * 2).next_power_of_two().max(2);
+        let mask = cap - 1;
+        let mut t = vec![Slot::default(); cap];
+        for (&k, &i) in &maps[u] {
+            let b = best[root[i as usize] as usize] as usize;
+            let (hi, lo) = ((k >> 64) as u64, k as u64);
+            let mut j = lo as usize & mask;
+            while t[j].hi != 0 || t[j].lo != 0 {
+                j = (j + 1) & mask;
+            }
+            t[j] = Slot { hi, lo, phi: hs[b].0, plo: hs[b].1, pref: refs[b] };
+        }
+        v.push((u, (mask, t)));
     })
     .into_iter()
     .flatten()
     .collect::<std::collections::BTreeMap<_, _>>()
     .into_values()
     .collect();
-    Links(maps)
+    Links(tables)
 }
 
 fn json_field(s: &str, name: &str) -> i64 {
@@ -469,7 +570,9 @@ fn main() {
     channels.push(b"organic");
     let ncamp = camp_names.len();
 
-    // stage 1, concurrent with building links: events into eid partitions, valid clicks into uid partitions
+    // stage 1, concurrent with building links: each chunk's events become one exact-size buffer,
+    // counting-sorted into P eid partitions; each chunk's valid clicks one exact-size buffer.
+    // Exact sizes matter: every freshly touched page is zeroed by the kernel.
     // (click dedup is a no-op: copies are identical, and credit/assist results don't change with repeats)
     let ev_chunks = chunks(&data.join("events"));
     let ck_chunks = chunks(&data.join("clicks"));
@@ -481,9 +584,10 @@ fn main() {
         let s1 = par(
             nt,
             ne + ck_chunks.len(),
-            || ((0..P).map(|_| Vec::<E1>::new()).collect::<Vec<_>>(), (0..Q).map(|_| Vec::<C2>::new()).collect::<Vec<_>>()),
-            |(parts, cparts), i| {
+            || (Vec::<E1>::new(), Vec::<C2>::new(), Vec::<u32>::new(), Vec::<Parted<E1>>::new(), Vec::<Vec<C2>>::new()),
+            |(tmp, tmpc, hist, evp, ckv), i| {
                 if i >= ne {
+                    tmpc.clear();
                     for_lines(ck_chunks[i - ne], |l| {
                         let Some([cid, uid, cp, ts]) = split::<4>(l) else { return };
                         if cid.is_empty() || uid.is_empty() {
@@ -492,10 +596,12 @@ fn main() {
                         let Some(t) = parse_ts(ts).filter(|&t| t >= cws && t < we) else { return };
                         let Some(&c) = camp.get(cp) else { return };
                         let (h, lo) = h128(uid);
-                        cparts[h as usize & (Q - 1)].push(C2 { phi: h, plo: lo, ts: t, cref: sref(cid), camp: c });
+                        tmpc.push(C2 { phi: h, plo: lo, ts: t, cref: sref(cid), camp: c });
                     });
+                    ckv.push(tmpc.clone());
                     return;
                 }
+                tmp.clear();
                 for_lines(ev_chunks[i], |l| {
                     let Some([eid, uid, ts, ing, typ, pr, price]) = split::<7>(l) else { return };
                     if eid.is_empty() {
@@ -533,7 +639,7 @@ fn main() {
                     }
                     let (ehi, elo) = h128(eid);
                     let (uhi, ulo) = if valid { h128(uid) } else { (0, 0) };
-                    parts[ehi as usize & (P - 1)].push(E1 {
+                    tmp.push(E1 {
                         ehi,
                         elo,
                         uhi,
@@ -545,94 +651,113 @@ fn main() {
                         cat,
                         valid,
                     });
-                })
+                });
+                evp.push(Parted::new(tmp, P, hist, |r| r.ehi as usize & (P - 1)));
             },
         );
         (s1, lh.join().unwrap())
     });
+    let (mut evp, mut ckv) = (Vec::new(), Vec::new());
+    for st in s1 {
+        evp.extend(st.3);
+        ckv.extend(st.4);
+    }
     log("parsed, links built");
 
-    // stage 2: dedup per eid partition (smallest ingest wins, before validation); valid survivors
-    // go to uid partitions as E2 with the uid still in phi/plo
+    // stage 2: per eid partition, dedup (smallest ingest wins, before validation) and send valid
+    // survivors to person partitions; jobs >= P map one chunk of clicks to persons
+    const D: usize = 16; // prefetch distance for link-table lookups
     let s2 = par(
         nt,
-        P,
-        || (IdMap::<(u32, i64)>::default(), Vec::<bool>::new(), (0..Q).map(|_| Vec::<E2>::new()).collect::<Vec<_>>()),
-        |(best, dead, parts), p| {
+        P + ckv.len(),
+        || {
+            (
+                IdMap::<(u32, i64)>::default(),
+                Vec::<bool>::new(),
+                Vec::<&E1>::new(),
+                Vec::<u32>::new(),
+                (Vec::<E2>::new(), Vec::<C2>::new(), Vec::<u32>::new()),
+                (Vec::<Parted<E2>>::new(), Vec::<Parted<C2>>::new()),
+            )
+        },
+        |(best, dead, all, surv, (te, tc, hist), (eo, co)), p| {
+            if p >= P {
+                let cs = &ckv[p - P];
+                tc.clear();
+                for k in 0..cs.len() {
+                    if k + D < cs.len() {
+                        links.prefetch(cs[k + D].phi, cs[k + D].plo);
+                    }
+                    let c = &cs[k];
+                    let (phi, plo, _) = links.person(c.phi, c.plo, SRef(0));
+                    tc.push(C2 { phi, plo, ..*c });
+                }
+                co.push(Parted::new(tc, Q, hist, |c| c.phi as usize & (Q - 1)));
+                return;
+            }
+            all.clear();
+            for e in &evp {
+                all.extend(e.get(p).iter());
+            }
             best.clear();
             dead.clear();
-            for st in &s1 {
-                for r in &st.0[p] {
-                    let g = dead.len() as u32;
-                    dead.push(false);
-                    match best.entry(key(r.ehi, r.elo)) {
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert((g, r.ingest));
-                        }
-                        std::collections::hash_map::Entry::Occupied(mut o) => {
-                            let (og, oi) = *o.get();
-                            if r.ingest < oi {
-                                dead[og as usize] = true;
-                                o.insert((g, r.ingest));
-                            } else {
-                                dead[g as usize] = true;
-                            }
+            dead.resize(all.len(), false);
+            for (g, r) in all.iter().enumerate() {
+                match best.entry(key(r.ehi, r.elo)) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert((g as u32, r.ingest));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        let (og, oi) = *o.get();
+                        if r.ingest < oi {
+                            dead[og as usize] = true;
+                            o.insert((g as u32, r.ingest));
+                        } else {
+                            dead[g] = true;
                         }
                     }
                 }
             }
-            let mut g = 0;
-            for st in &s1 {
-                for r in &st.0[p] {
-                    if r.valid && !dead[g] {
-                        parts[r.uhi as usize & (Q - 1)].push(E2 { phi: r.uhi, plo: r.ulo, ts: r.ts, nref: r.uref, price: r.price, cat: r.cat });
-                    }
-                    g += 1;
+            surv.clear();
+            surv.extend((0..all.len() as u32).filter(|&g| all[g as usize].valid && !dead[g as usize]));
+            te.clear();
+            for k in 0..surv.len() {
+                if k + D < surv.len() {
+                    let r = all[surv[k + D] as usize];
+                    links.prefetch(r.uhi, r.ulo);
                 }
+                let r = all[surv[k] as usize];
+                let (phi, plo, nref) = links.person(r.uhi, r.ulo, r.uref);
+                te.push(E2 { phi, plo, ts: r.ts, nref, price: r.price, cat: r.cat });
             }
+            eo.push(Parted::new(te, Q, hist, |e| e.phi as usize & (Q - 1)));
         },
     );
-    log("deduped");
-
-    // stage 2.5: per uid partition, map IDs to persons with that partition's small link map
-    let s25 = par(
-        nt,
-        Q,
-        || ((0..Q).map(|_| Vec::<E2>::new()).collect::<Vec<_>>(), (0..Q).map(|_| Vec::<C2>::new()).collect::<Vec<_>>()),
-        |(ep, cp), u| {
-            for st in &s2 {
-                for e in &st.2[u] {
-                    let (phi, plo, nref) = links.person(e.phi, e.plo, e.nref);
-                    ep[phi as usize & (Q - 1)].push(E2 { phi, plo, nref, ..*e });
-                }
-            }
-            for st in &s1 {
-                for c in &st.1[u] {
-                    let (phi, plo, _) = links.person(c.phi, c.plo, SRef(0));
-                    cp[phi as usize & (Q - 1)].push(C2 { phi, plo, ..*c });
-                }
-            }
-        },
-    );
-    std::mem::forget(s1); // ponytail: freeing GBs costs time; the process exits soon
-    std::mem::forget(s2);
-    log("mapped to persons");
+    let (mut ep, mut cp) = (Vec::new(), Vec::new());
+    for st in s2 {
+        ep.extend(st.5 .0);
+        cp.extend(st.5 .1);
+    }
+    log("deduped, mapped to persons");
+    std::mem::forget(evp); // ponytail: freeing GBs costs time; the process exits soon
+    std::mem::forget(ckv);
 
     // stage 3: per person partition
     let ncat = cat_names.len();
     let s3 = par(
         nt,
         Q,
-        || (vec![[0i64; 4]; ncamp * ndays], Vec::<URow>::new()),
-        |(cc, rows), q| {
-            let mut ev: Vec<&E2> = s25.iter().flat_map(|s| s.0[q].iter()).collect();
-            let mut ck: Vec<&C2> = s25.iter().flat_map(|s| s.1[q].iter()).collect();
-            ev.sort_unstable_by_key(|e| (e.phi, e.plo, e.ts));
-            ck.sort_unstable_by_key(|c| (c.phi, c.plo, c.ts));
+        || (vec![[0i64; 4]; ncamp * ndays], Vec::<URow>::new(), Vec::<E2>::new(), Vec::<C2>::new(), Vec::<u32>::new()),
+        |(cc, rows, ev, ck, hist), q| {
+            let tm = std::time::Instant::now();
+            group(ep.iter().map(|x| x.get(q)), ev, hist, |e| (e.phi, e.plo, e.ts));
+            group(cp.iter().map(|x| x.get(q)), ck, hist, |c| (c.phi, c.plo, c.ts));
+            let (ev, ck) = (&ev[..], &ck[..]);
+            T_A.fetch_add(tm.elapsed().as_nanos() as usize, Ordering::Relaxed);
             let mut catsum = vec![0i64; ncat];
             let mut starts: Vec<i64> = Vec::new();
             let mut sdays: Vec<u32> = Vec::new();
-            let mut byc: Vec<&C2> = Vec::new();
+            let mut byc: Vec<C2> = Vec::new();
             let (mut a, mut c) = (0, 0);
             while a < ev.len() {
                 let (phi, plo) = (ev[a].phi, ev[a].plo);
@@ -771,12 +896,12 @@ fn main() {
             }
         },
     );
-    log("sessions done");
+    log(&format!("sessions done; gather+sort {:.3}s cpu", T_A.load(Ordering::Relaxed) as f64/1e9));
 
     std::fs::create_dir_all(out.join("user_daily")).unwrap();
     std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
     let mut cc = vec![[0i64; 4]; ncamp * ndays];
-    for (c, _) in &s3 {
+    for (c, ..) in &s3 {
         for (x, y) in cc.iter_mut().zip(c) {
             for k in 0..4 {
                 x[k] += y[k];
