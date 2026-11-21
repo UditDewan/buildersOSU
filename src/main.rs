@@ -148,11 +148,23 @@ fn par<T: Send>(
     init: impl Fn() -> T + Sync,
     work: impl Fn(&mut T, usize) + Sync,
 ) -> Vec<T> {
+    par_fin(nt, n, init, work, |_, _| {})
+}
+
+/// `par`, plus `fin(state, thread)` run on each thread once it finds no more jobs.
+fn par_fin<T: Send>(
+    nt: usize,
+    n: usize,
+    init: impl Fn() -> T + Sync,
+    work: impl Fn(&mut T, usize) + Sync,
+    fin: impl Fn(&mut T, usize) + Sync,
+) -> Vec<T> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt.min(n.max(1)))
-            .map(|_| {
-                s.spawn(|| {
+            .map(|k| {
+                let (init, work, fin, next) = (&init, &work, &fin, &next);
+                s.spawn(move || {
                     let mut st = init();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -161,6 +173,7 @@ fn par<T: Send>(
                         }
                         work(&mut st, i);
                     }
+                    fin(&mut st, k);
                     st
                 })
             })
@@ -1144,7 +1157,11 @@ fn main() {
 
     // stage 3: per person partition
     let ncat = cat_names.len();
-    let s3 = par(
+    std::fs::create_dir_all(out.join("user_daily")).unwrap();
+    std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
+    let cats: Vec<&[u8]> = cat_names.clone();
+    // each thread writes its user_daily file as soon as it runs out of person partitions
+    let s3 = par_fin(
         nt,
         nq,
         || {
@@ -1310,11 +1327,17 @@ fn main() {
                 c = d;
             }
         },
+        |st, k| {
+            write_user(
+                &out.join(format!("user_daily/part-{k}.parquet")),
+                &st.1,
+                &cats,
+                &long,
+            );
+        },
     );
-    log("sessions done");
+    log("sessions done, user_daily written");
 
-    std::fs::create_dir_all(out.join("user_daily")).unwrap();
-    std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
     let mut cc = vec![[0i64; 4]; ncamp * ndays];
     for (c, ..) in &s3 {
         for (x, y) in cc.iter_mut().zip(c) {
@@ -1334,20 +1357,6 @@ fn main() {
         &camp_names,
         &channels,
         ws_day,
-    );
-    let cats: Vec<&[u8]> = cat_names.clone();
-    par(
-        nt,
-        s3.len(),
-        || (),
-        |_, i| {
-            write_user(
-                &out.join(format!("user_daily/part-{i}.parquet")),
-                &s3[i].1,
-                &cats,
-                &long,
-            );
-        },
     );
     log("written");
 }
