@@ -344,7 +344,10 @@ impl Group {
         // Clicks of people with no surviving event credit nothing: they are left out.
         let click_count: usize = clicks.iter().map(|c| c[partition].iter().map(|x| x.1 as usize).sum::<usize>()).sum();
         self.click_cursor.clear();
-        self.click_cursor.resize(self.people.len(), 0);
+        // One cursor more than there are people: an absent click's (below), which
+        // counts nothing and so starts at `kept`, past every kept click.
+        self.click_cursor.resize(self.people.len() + 1, 0);
+        let spare = self.people.len();
         self.click_person.clear();
         self.click_person.reserve(click_count);
         let mut seen = 0;
@@ -381,7 +384,7 @@ impl Group {
         unsafe { self.click_person.set_len(seen) };
         let kept = Self::offsets(&mut self.click_cursor, &mut self.click_start);
         self.clicks.clear();
-        self.clicks.reserve(kept);
+        self.clicks.reserve(seen);
         unsafe { self.clicks.set_len(kept) };
         {
             let click_person = self.click_person.as_ptr();
@@ -394,13 +397,14 @@ impl Group {
                     for record in records {
                         let number = unsafe { *click_person.add(at) };
                         at += 1;
-                        if number != ABSENT {
-                            unsafe {
-                                let cursor = click_cursor.add(number as usize);
-                                let place = *cursor;
-                                *sorted.add(place as usize) = [(u64::from(record.ts) << 32) | u64::from(record.campaign), record.click];
-                                *cursor = place + 1;
-                            }
+                        // A click of nobody with a surviving event goes to the spare
+                        // cursor, past the end, instead of being branched around (BENCH.md, experiment 51).
+                        let person = std::hint::select_unpredictable(number == ABSENT, spare, number as usize);
+                        unsafe {
+                            let cursor = click_cursor.add(person);
+                            let place = *cursor;
+                            *sorted.add(place as usize) = [(u64::from(record.ts) << 32) | u64::from(record.campaign), record.click];
+                            *cursor = place + 1;
                         }
                     }
                 }
