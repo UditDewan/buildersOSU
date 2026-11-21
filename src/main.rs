@@ -20,10 +20,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
-const P: usize = 512; // eid partitions
-const Q: usize = 512; // person partitions
-static T_A: AtomicUsize = AtomicUsize::new(0);
-const CHUNK: usize = 4 << 20;
+const L: usize = 512; // link sub-tables
 
 // ---------- small utilities ----------
 
@@ -85,7 +82,12 @@ fn key(hi: u64, lo: u64) -> u128 {
     (hi as u128) << 64 | lo as u128
 }
 
-fn par<T: Send>(nt: usize, n: usize, init: impl Fn() -> T + Sync, work: impl Fn(&mut T, usize) + Sync) -> Vec<T> {
+fn par<T: Send>(
+    nt: usize,
+    n: usize,
+    init: impl Fn() -> T + Sync,
+    work: impl Fn(&mut T, usize) + Sync,
+) -> Vec<T> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt.min(n.max(1)))
@@ -109,7 +111,12 @@ fn par<T: Send>(nt: usize, n: usize, init: impl Fn() -> T + Sync, work: impl Fn(
 
 /// Concatenates `src` into `out` sorted by `key` (whose first part is a random hash): one
 /// counting-sort pass on its top bits, then tiny sorts per bucket.
-fn group<'a, T: Copy + Default + 'a>(src: impl Iterator<Item = &'a [T]> + Clone, out: &mut Vec<T>, hist: &mut Vec<u32>, key: impl Fn(&T) -> (u64, u64, i64)) {
+fn group<'a, T: Copy + Default + 'a>(
+    src: impl Iterator<Item = &'a [T]> + Clone,
+    out: &mut Vec<T>,
+    hist: &mut Vec<u32>,
+    key: impl Fn(&T) -> (u64, u64, i64),
+) {
     let n: usize = src.clone().map(|s| s.len()).sum();
     let bits = (usize::BITS - n.max(2).leading_zeros()).clamp(4, 22);
     let shift = 64 - bits;
@@ -179,7 +186,11 @@ impl<T: Copy> Parted<T> {
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
-    let (nl, cm, qt) = (_mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8));
+    let (nl, cm, qt) = (
+        _mm_set1_epi8(b'\n' as i8),
+        _mm_set1_epi8(b',' as i8),
+        _mm_set1_epi8(b'"' as i8),
+    );
     let (mut a, mut b, mut c) = (0u64, 0u64, 0u64);
     for k in 0..4 {
         let v = _mm_loadu_si128(p.add(16 * k) as *const __m128i);
@@ -222,7 +233,14 @@ fn for_records<const N: usize>(chunk: &'static [u8], mut f: impl FnMut([&'static
         st.state = 0;
     }
     let n = chunk.len();
-    let mut st = St::<N> { fields: [&[]; N], nf: 0, fstart: 0, state: 0, qclose: 0, bad: false };
+    let mut st = St::<N> {
+        fields: [&[]; N],
+        nf: 0,
+        fstart: 0,
+        state: 0,
+        qclose: 0,
+        bad: false,
+    };
     let mut blk = 0;
     let mut tail = [0u8; 64];
     while blk < n {
@@ -354,20 +372,26 @@ fn map_file(path: &Path) -> &'static [u8] {
     Box::leak(Box::new(m))
 }
 
-/// Data lines (header dropped) of every *.csv in dir, cut into ~CHUNK pieces on line boundaries.
-fn chunks(dir: &Path) -> Vec<&'static [u8]> {
+/// Data lines (header dropped) of every *.csv in dir, cut on line boundaries into pieces of at
+/// least 4 MiB and about 24 per thread: few enough that the later fan-in over chunks stays cheap.
+fn chunks(dir: &Path, nt: usize) -> Vec<&'static [u8]> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
-    for e in rd {
-        let p = e.unwrap().path();
-        if p.extension().map_or(true, |x| x != "csv") || !p.is_file() {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let files: Vec<&'static [u8]> = rd
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "csv") && p.is_file())
+        .map(|p| map_file(&p))
+        .collect();
+    let chunk = (files.iter().map(|d| d.len()).sum::<usize>() / (nt * 24)).max(4 << 20);
+    for d in files {
+        let Some(h) = memchr::memchr(b'\n', d) else {
             continue;
-        }
-        let d = map_file(&p);
-        let Some(h) = memchr::memchr(b'\n', d) else { continue };
+        };
         let mut s = h + 1;
         while s < d.len() {
-            let mut e = (s + CHUNK).min(d.len());
+            let mut e = (s + chunk).min(d.len());
             if e < d.len() {
                 e = memchr::memchr(b'\n', &d[e..]).map_or(d.len(), |i| e + i + 1);
             }
@@ -423,7 +447,20 @@ fn parse_dt(s: &[u8]) -> Option<i64> {
         return None;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let dim = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo as usize - 1];
+    let dim = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][mo as usize - 1];
     if d > dim {
         return None;
     }
@@ -443,7 +480,11 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
                 return None;
             }
             let off = (oh * 60 + om) * 60_000;
-            Some(if s[19] == b'+' { base - off } else { base + off })
+            Some(if s[19] == b'+' {
+                base - off
+            } else {
+                base + off
+            })
         }
         _ => {
             let mut v: u64 = 0;
@@ -537,7 +578,7 @@ struct Slot {
     plo: u64,
     pref: SRef,
 }
-/// Linked IDs -> person, as Q flat linear-probing tables picked by `hi`, indexed by `lo`.
+/// Linked IDs -> person, as L flat linear-probing tables picked by `hi`, indexed by `lo`.
 struct Links(Vec<(usize, Vec<Slot>)>);
 impl Links {
     #[inline]
@@ -545,13 +586,13 @@ impl Links {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let (mask, t) = &self.0[hi as usize & (Q - 1)];
+            let (mask, t) = &self.0[hi as usize & (L - 1)];
             _mm_prefetch::<_MM_HINT_T0>(t.as_ptr().add(lo as usize & mask) as *const i8);
         }
     }
     #[inline]
     fn person(&self, hi: u64, lo: u64, r: SRef) -> Person {
-        let (mask, t) = &self.0[hi as usize & (Q - 1)];
+        let (mask, t) = &self.0[hi as usize & (L - 1)];
         let mut i = lo as usize & mask;
         loop {
             let s = &t[i];
@@ -567,17 +608,22 @@ impl Links {
 }
 
 fn build_links(nt: usize, dir: &Path) -> Links {
-    let ch = chunks(dir);
-    let parts = par(nt, ch.len(), Vec::new, |v: &mut Vec<(SRef, u64, u64, SRef, u64, u64)>, i| {
-        for_records(ch[i], |[a, b]: [&'static [u8]; 2]| {
-            if !a.is_empty() && !b.is_empty() {
-                let (ah, al) = h128(a);
-                let (bh, bl) = h128(b);
-                v.push((sref(a), ah, al, sref(b), bh, bl));
-            }
-        })
-    });
-    let mut maps: Vec<IdMap<u32>> = (0..Q).map(|_| IdMap::default()).collect();
+    let ch = chunks(dir, nt);
+    let parts = par(
+        nt,
+        ch.len(),
+        Vec::new,
+        |v: &mut Vec<(SRef, u64, u64, SRef, u64, u64)>, i| {
+            for_records(ch[i], |[a, b]: [&'static [u8]; 2]| {
+                if !a.is_empty() && !b.is_empty() {
+                    let (ah, al) = h128(a);
+                    let (bh, bl) = h128(b);
+                    v.push((sref(a), ah, al, sref(b), bh, bl));
+                }
+            })
+        },
+    );
+    let mut maps: Vec<IdMap<u32>> = (0..L).map(|_| IdMap::default()).collect();
     let mut refs: Vec<SRef> = Vec::new();
     let mut hs: Vec<(u64, u64)> = Vec::new();
     let mut parent: Vec<u32> = Vec::new();
@@ -590,13 +636,15 @@ fn build_links(nt: usize, dir: &Path) -> Links {
         x
     }
     let mut intern = |r: SRef, h: u64, l: u64, parent: &mut Vec<u32>| -> u32 {
-        *maps[h as usize & (Q - 1)].entry(key(h, l)).or_insert_with(|| {
-            let i = refs.len() as u32;
-            refs.push(r);
-            hs.push((h, l));
-            parent.push(i);
-            i
-        })
+        *maps[h as usize & (L - 1)]
+            .entry(key(h, l))
+            .or_insert_with(|| {
+                let i = refs.len() as u32;
+                refs.push(r);
+                hs.push((h, l));
+                parent.push(i);
+                i
+            })
     };
     for v in &parts {
         for &(a, ah, al, b, bh, bl) in v {
@@ -617,21 +665,32 @@ fn build_links(nt: usize, dir: &Path) -> Links {
             best[r] = i as u32;
         }
     }
-    let tables: Vec<(usize, Vec<Slot>)> = par(nt, Q, Vec::new, |v: &mut Vec<(usize, (usize, Vec<Slot>))>, u| {
-        let cap = (maps[u].len() * 2).next_power_of_two().max(2);
-        let mask = cap - 1;
-        let mut t = vec![Slot::default(); cap];
-        for (&k, &i) in &maps[u] {
-            let b = best[root[i as usize] as usize] as usize;
-            let (hi, lo) = ((k >> 64) as u64, k as u64);
-            let mut j = lo as usize & mask;
-            while t[j].hi != 0 || t[j].lo != 0 {
-                j = (j + 1) & mask;
+    let tables: Vec<(usize, Vec<Slot>)> = par(
+        nt,
+        L,
+        Vec::new,
+        |v: &mut Vec<(usize, (usize, Vec<Slot>))>, u| {
+            let cap = (maps[u].len() * 2).next_power_of_two().max(2);
+            let mask = cap - 1;
+            let mut t = vec![Slot::default(); cap];
+            for (&k, &i) in &maps[u] {
+                let b = best[root[i as usize] as usize] as usize;
+                let (hi, lo) = ((k >> 64) as u64, k as u64);
+                let mut j = lo as usize & mask;
+                while t[j].hi != 0 || t[j].lo != 0 {
+                    j = (j + 1) & mask;
+                }
+                t[j] = Slot {
+                    hi,
+                    lo,
+                    phi: hs[b].0,
+                    plo: hs[b].1,
+                    pref: refs[b],
+                };
             }
-            t[j] = Slot { hi, lo, phi: hs[b].0, plo: hs[b].1, pref: refs[b] };
-        }
-        v.push((u, (mask, t)));
-    })
+            v.push((u, (mask, t)));
+        },
+    )
     .into_iter()
     .flatten()
     .collect::<std::collections::BTreeMap<_, _>>()
@@ -653,9 +712,11 @@ fn main() {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data = std::path::PathBuf::from(env("DATA_DIR", "/data"));
     let out = std::path::PathBuf::from(env("OUTPUT_DIR", "/output"));
-    let nt: usize = env("NCPU", "0").parse().ok().filter(|&n| n > 0).unwrap_or_else(|| {
-        std::thread::available_parallelism().map_or(8, usize::from)
-    });
+    let nt: usize = env("NCPU", "0")
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from));
     let log = |m: &str| eprintln!("[{:7.3}s] {m}", t0.elapsed().as_secs_f64());
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).unwrap();
@@ -669,10 +730,18 @@ fn main() {
         .into_iter()
         .filter_map(|l| split::<2>(l).map(|[a, b]| (a, b)))
         .collect();
-    let mut cat_names: Vec<&[u8]> = prod_rows.iter().map(|r| r.1).chain([&b"unknown"[..]]).collect();
+    let mut cat_names: Vec<&[u8]> = prod_rows
+        .iter()
+        .map(|r| r.1)
+        .chain([&b"unknown"[..]])
+        .collect();
     cat_names.sort();
     cat_names.dedup();
-    let cat_idx: FxHashMap<&[u8], u16> = cat_names.iter().enumerate().map(|(i, c)| (*c, i as u16)).collect();
+    let cat_idx: FxHashMap<&[u8], u16> = cat_names
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (*c, i as u16))
+        .collect();
     let unknown = cat_idx[&b"unknown"[..]];
     let prod: FxHashMap<&[u8], u16> = prod_rows.iter().map(|r| (r.0, cat_idx[r.1])).collect();
 
@@ -684,19 +753,34 @@ fn main() {
             channels.push(b);
         }
     }
-    let camp: FxHashMap<&[u8], u32> = camp_names.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
+    let camp: FxHashMap<&[u8], u32> = camp_names
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (*c, i as u32))
+        .collect();
     let organic = camp_names.len() as u32;
     camp_names.push(b"organic");
     channels.push(b"organic");
     let ncamp = camp_names.len();
 
     // stage 1, concurrent with building links: each chunk's events become one exact-size buffer,
-    // counting-sorted into P eid partitions; each chunk's valid clicks one exact-size buffer.
+    // counting-sorted into np eid partitions; each chunk's valid clicks one exact-size buffer.
     // Exact sizes matter: every freshly touched page is zeroed by the kernel.
     // (click dedup is a no-op: copies are identical, and credit/assist results don't change with repeats)
-    let ev_chunks = chunks(&data.join("events"));
-    let ck_chunks = chunks(&data.join("clicks"));
+    let ev_chunks = chunks(&data.join("events"), nt);
+    let ck_chunks = chunks(&data.join("clicks"), nt);
     let ne = ev_chunks.len();
+    // partitions (eid and person) scale with the input so each stays cache-sized
+    let ev_bytes: usize = ev_chunks.iter().map(|c| c.len()).sum();
+    let np: usize = std::env::var("PQ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            (ev_bytes / 75 / 20_000)
+                .next_power_of_two()
+                .clamp(256, 4096)
+        });
+    let nq = np;
     let links_dir = data.join("links");
     let cws = ws - WEEK;
     let links_cell = std::sync::OnceLock::<Links>::new();
@@ -707,78 +791,100 @@ fn main() {
         par(
             nt,
             ne + ck_chunks.len(),
-            || (Vec::<E1>::new(), Vec::<C2>::new(), Vec::<u32>::new(), Vec::<Parted<E1>>::new(), Vec::<Parted<C2>>::new()),
+            || {
+                (
+                    Vec::<E1>::new(),
+                    Vec::<C2>::new(),
+                    Vec::<u32>::new(),
+                    Vec::<Parted<E1>>::new(),
+                    Vec::<Parted<C2>>::new(),
+                )
+            },
             |(tmp, tmpc, hist, evp, cpp), i| {
                 if i >= ne {
                     // click chunks come last; links are long done by then
                     let links = links_cell.wait();
                     tmpc.clear();
-                    for_records(ck_chunks[i - ne], |[cid, uid, cp, ts]: [&'static [u8]; 4]| {
-                        if cid.is_empty() || uid.is_empty() {
-                            return;
-                        }
-                        let Some(t) = parse_ts(ts).filter(|&t| t >= cws && t < we) else { return };
-                        let Some(&c) = camp.get(cp) else { return };
-                        let (h, lo) = h128(uid);
-                        tmpc.push(C2 { phi: h, plo: lo, ts: (t - cws) as u32, cref: sref(cid), camp: c });
-                    });
+                    for_records(
+                        ck_chunks[i - ne],
+                        |[cid, uid, cp, ts]: [&'static [u8]; 4]| {
+                            if cid.is_empty() || uid.is_empty() {
+                                return;
+                            }
+                            let Some(t) = parse_ts(ts).filter(|&t| t >= cws && t < we) else {
+                                return;
+                            };
+                            let Some(&c) = camp.get(cp) else { return };
+                            let (h, lo) = h128(uid);
+                            tmpc.push(C2 {
+                                phi: h,
+                                plo: lo,
+                                ts: (t - cws) as u32,
+                                cref: sref(cid),
+                                camp: c,
+                            });
+                        },
+                    );
                     // ponytail: no prefetch here; clicks are a fifth of the rows
                     for c in tmpc.iter_mut() {
                         let (phi, plo, _) = links.person(c.phi, c.plo, SRef(0));
                         c.phi = phi;
                         c.plo = plo;
                     }
-                    cpp.push(Parted::new(tmpc, Q, hist, |c| c.phi as usize & (Q - 1)));
+                    cpp.push(Parted::new(tmpc, nq, hist, |c| c.phi as usize & (nq - 1)));
                     return;
                 }
                 tmp.clear();
-                for_records(ev_chunks[i], |[eid, uid, ts, ing, typ, pr, price]: [&'static [u8]; 7]| {
-                    if eid.is_empty() {
-                        return;
-                    }
-                    let ingest = parse_ts(ing).unwrap_or(i64::MAX);
-                    let mut valid = !uid.is_empty() && !pr.is_empty();
-                    let t = match parse_ts(ts) {
-                        Some(v) if v >= ws && v < we => v,
-                        _ => {
-                            valid = false;
-                            0
+                for_records(
+                    ev_chunks[i],
+                    |[eid, uid, ts, ing, typ, pr, price]: [&'static [u8]; 7]| {
+                        if eid.is_empty() {
+                            return;
                         }
-                    };
-                    let purchase = match typ {
-                        b"view" | b"cart" => false,
-                        b"purchase" => true,
-                        _ => {
-                            valid = false;
-                            false
-                        }
-                    };
-                    let (mut p, mut cat) = (0, 0);
-                    if valid && purchase {
-                        match parse_price(price) {
-                            Some(v) => {
-                                p = v;
-                                cat = prod.get(pr).copied().unwrap_or(unknown);
+                        let ingest = parse_ts(ing).unwrap_or(i64::MAX);
+                        let mut valid = !uid.is_empty() && !pr.is_empty();
+                        let t = match parse_ts(ts) {
+                            Some(v) if v >= ws && v < we => v,
+                            _ => {
+                                valid = false;
+                                0
                             }
-                            None => valid = false,
+                        };
+                        let purchase = match typ {
+                            b"view" | b"cart" => false,
+                            b"purchase" => true,
+                            _ => {
+                                valid = false;
+                                false
+                            }
+                        };
+                        let (mut p, mut cat) = (0, 0);
+                        if valid && purchase {
+                            match parse_price(price) {
+                                Some(v) => {
+                                    p = v;
+                                    cat = prod.get(pr).copied().unwrap_or(unknown);
+                                }
+                                None => valid = false,
+                            }
                         }
-                    }
-                    if valid && ingest - t > DAY {
-                        valid = false;
-                    }
-                    let (ehi, elo) = h128(eid);
-                    tmp.push(E1 {
-                        ehi,
-                        elo,
-                        ts: if valid { (t - cws) as u32 } else { 0 },
-                        ingest,
-                        uref: if valid { sref(uid) } else { SRef(0) },
-                        price: p,
-                        cat,
-                        valid,
-                    });
-                });
-                evp.push(Parted::new(tmp, P, hist, |r| r.ehi as usize & (P - 1)));
+                        if valid && ingest - t > DAY {
+                            valid = false;
+                        }
+                        let (ehi, elo) = h128(eid);
+                        tmp.push(E1 {
+                            ehi,
+                            elo,
+                            ts: if valid { (t - cws) as u32 } else { 0 },
+                            ingest,
+                            uref: if valid { sref(uid) } else { SRef(0) },
+                            price: p,
+                            cat,
+                            valid,
+                        });
+                    },
+                );
+                evp.push(Parted::new(tmp, np, hist, |r| r.ehi as usize & (np - 1)));
             },
         )
     });
@@ -792,65 +898,83 @@ fn main() {
 
     // stage 2: per eid partition, dedup (smallest ingest wins, before validation) and send valid
     // survivors to person partitions
-    const D: usize = 16; // prefetch distance for link-table lookups
+    const D: usize = 16; // prefetch distance
+                         // partitions go in batches so each batch emits one buffer (cheap fan-in for stage 3)
+    let per = np.div_ceil(nt * 8);
+    let nb = np.div_ceil(per);
     let s2 = par(
         nt,
-        P,
+        nb,
         || {
             (
                 IdMap::<(u32, i64)>::default(),
                 Vec::<bool>::new(),
                 Vec::<&E1>::new(),
                 Vec::<u32>::new(),
-                (Vec::<E2>::new(), Vec::<(u64, u64)>::new(), Vec::<u32>::new()),
+                (
+                    Vec::<E2>::new(),
+                    Vec::<(u64, u64)>::new(),
+                    Vec::<u32>::new(),
+                ),
                 Vec::<Parted<E2>>::new(),
             )
         },
-        |(best, dead, all, surv, (te, uh, hist), eo), p| {
-            all.clear();
-            for e in &evp {
-                all.extend(e.get(p).iter());
-            }
-            best.clear();
-            dead.clear();
-            dead.resize(all.len(), false);
-            for (g, r) in all.iter().enumerate() {
-                match best.entry(key(r.ehi, r.elo)) {
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert((g as u32, r.ingest));
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut o) => {
-                        let (og, oi) = *o.get();
-                        if r.ingest < oi {
-                            dead[og as usize] = true;
-                            o.insert((g as u32, r.ingest));
-                        } else {
-                            dead[g] = true;
+        |(best, dead, all, surv, (te, uh, hist), eo), bi| {
+            te.clear();
+            for p in bi * per..((bi + 1) * per).min(np) {
+                all.clear();
+                for e in &evp {
+                    all.extend(e.get(p).iter());
+                }
+                best.clear();
+                dead.clear();
+                dead.resize(all.len(), false);
+                for (g, r) in all.iter().enumerate() {
+                    match best.entry(key(r.ehi, r.elo)) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert((g as u32, r.ingest));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut o) => {
+                            let (og, oi) = *o.get();
+                            if r.ingest < oi {
+                                dead[og as usize] = true;
+                                o.insert((g as u32, r.ingest));
+                            } else {
+                                dead[g] = true;
+                            }
                         }
                     }
                 }
-            }
-            surv.clear();
-            surv.extend((0..all.len() as u32).filter(|&g| all[g as usize].valid && !dead[g as usize]));
-            // uid hashes (prefetching uid bytes ahead), then link lookups (prefetching slots ahead)
-            let m = surv.len();
-            uh.clear();
-            for k in 0..m {
-                if k + D < m {
-                    prefetch_ptr(all[surv[k + D] as usize].uref.ptr());
+                surv.clear();
+                surv.extend(
+                    (0..all.len() as u32).filter(|&g| all[g as usize].valid && !dead[g as usize]),
+                );
+                // uid hashes (prefetching uid bytes ahead), then link lookups (prefetching slots ahead)
+                let m = surv.len();
+                uh.clear();
+                for k in 0..m {
+                    if k + D < m {
+                        prefetch_ptr(all[surv[k + D] as usize].uref.ptr());
+                    }
+                    uh.push(h128(all[surv[k] as usize].uref.get()));
                 }
-                uh.push(h128(all[surv[k] as usize].uref.get()));
-            }
-            te.clear();
-            for k in 0..m {
-                if k + D < m {
-                    links.prefetch(uh[k + D].0, uh[k + D].1);
+                for k in 0..m {
+                    if k + D < m {
+                        links.prefetch(uh[k + D].0, uh[k + D].1);
+                    }
+                    let r = all[surv[k] as usize];
+                    let (phi, plo, nref) = links.person(uh[k].0, uh[k].1, r.uref);
+                    te.push(E2 {
+                        phi,
+                        plo,
+                        ts: r.ts,
+                        nref,
+                        price: r.price,
+                        cat: r.cat,
+                    });
                 }
-                let r = all[surv[k] as usize];
-                let (phi, plo, nref) = links.person(uh[k].0, uh[k].1, r.uref);
-                te.push(E2 { phi, plo, ts: r.ts, nref, price: r.price, cat: r.cat });
             }
-            eo.push(Parted::new(te, Q, hist, |e| e.phi as usize & (Q - 1)));
+            eo.push(Parted::new(te, nq, hist, |e| e.phi as usize & (nq - 1)));
         },
     );
     let mut ep = Vec::new();
@@ -864,14 +988,24 @@ fn main() {
     let ncat = cat_names.len();
     let s3 = par(
         nt,
-        Q,
-        || (vec![[0i64; 4]; ncamp * ndays], Vec::<URow>::new(), Vec::<E2>::new(), Vec::<C2>::new(), Vec::<u32>::new()),
+        nq,
+        || {
+            (
+                vec![[0i64; 4]; ncamp * ndays],
+                Vec::<URow>::new(),
+                Vec::<E2>::new(),
+                Vec::<C2>::new(),
+                Vec::<u32>::new(),
+            )
+        },
         |(cc, rows, ev, ck, hist), q| {
-            let tm = std::time::Instant::now();
-            group(ep.iter().map(|x| x.get(q)), ev, hist, |e| (e.phi, e.plo, e.t()));
-            group(cp.iter().map(|x| x.get(q)), ck, hist, |c| (c.phi, c.plo, c.t()));
+            group(ep.iter().map(|x| x.get(q)), ev, hist, |e| {
+                (e.phi, e.plo, e.t())
+            });
+            group(cp.iter().map(|x| x.get(q)), ck, hist, |c| {
+                (c.phi, c.plo, c.t())
+            });
             let (ev, ck) = (&ev[..], &ck[..]);
-            T_A.fetch_add(tm.elapsed().as_nanos() as usize, Ordering::Relaxed);
             let mut catsum = vec![0i64; ncat];
             let mut starts: Vec<i64> = Vec::new();
             let mut sdays: Vec<u32> = Vec::new();
@@ -947,7 +1081,14 @@ fn main() {
                             r.revenue += rev;
                         }
                         _ => {
-                            day_row = Some(URow { nref, day: eday as i32, sessions: 1, events: (j - i) as u32, revenue: rev, top: u16::MAX });
+                            day_row = Some(URow {
+                                nref,
+                                day: eday as i32,
+                                sessions: 1,
+                                events: (j - i) as u32,
+                                revenue: rev,
+                                top: u16::MAX,
+                            });
                         }
                     }
                     // flush the day if the next session starts on another day
@@ -1012,7 +1153,7 @@ fn main() {
             }
         },
     );
-    log(&format!("sessions done; gather+sort {:.3}s cpu", T_A.load(Ordering::Relaxed) as f64/1e9));
+    log("sessions done");
 
     std::fs::create_dir_all(out.join("user_daily")).unwrap();
     std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
@@ -1029,11 +1170,26 @@ fn main() {
         .map(|(c, d)| (c, d, cc[c * ndays + d]))
         .filter(|r| r.2[0] > 0 || r.2[3] > 0)
         .collect();
-    write_campaign(&out.join("campaign_daily/part-0.parquet"), &crow, &camp_names, &channels, ws_day);
+    write_campaign(
+        &out.join("campaign_daily/part-0.parquet"),
+        &crow,
+        &camp_names,
+        &channels,
+        ws_day,
+    );
     let cats: Vec<&[u8]> = cat_names.clone();
-    par(nt, s3.len(), || (), |_, i| {
-        write_user(&out.join(format!("user_daily/part-{i}.parquet")), &s3[i].1, &cats);
-    });
+    par(
+        nt,
+        s3.len(),
+        || (),
+        |_, i| {
+            write_user(
+                &out.join(format!("user_daily/part-{i}.parquet")),
+                &s3[i].1,
+                &cats,
+            );
+        },
+    );
     log("written");
 }
 
@@ -1051,9 +1207,15 @@ fn ba(s: &'static [u8]) -> ByteArray {
 type Col<'a> = Box<dyn FnMut(&mut parquet::file::writer::SerializedColumnWriter<'_>) + 'a>;
 fn write_table(path: &Path, schema: &str, mut cols: Vec<Col<'_>>) {
     let schema = Arc::new(parse_message_type(schema).unwrap());
-    let props = Arc::new(WriterProperties::builder().set_dictionary_enabled(false).build());
+    let props = Arc::new(
+        WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .build(),
+    );
     let f = std::fs::File::create(path).unwrap();
-    let mut w = SerializedFileWriter::new(std::io::BufWriter::with_capacity(1 << 20, f), schema, props).unwrap();
+    let mut w =
+        SerializedFileWriter::new(std::io::BufWriter::with_capacity(1 << 20, f), schema, props)
+            .unwrap();
     let mut rg = w.next_row_group().unwrap();
     let mut i = 0;
     while let Some(mut col) = rg.next_column().unwrap() {
@@ -1100,7 +1262,13 @@ fn write_user(path: &Path, rows: &[URow], cats: &[&'static [u8]]) {
     );
 }
 
-fn write_campaign(path: &Path, rows: &[(usize, usize, [i64; 4])], names: &[&'static [u8]], channels: &[&'static [u8]], ws_day: i64) {
+fn write_campaign(
+    path: &Path,
+    rows: &[(usize, usize, [i64; 4])],
+    names: &[&'static [u8]],
+    channels: &[&'static [u8]],
+    ws_day: i64,
+) {
     let int = |k: usize| -> Col<'_> {
         Box::new(move |c| {
             let v: Vec<i64> = rows.iter().map(|r| r.2[k]).collect();
@@ -1136,10 +1304,22 @@ mod tests {
     use super::*;
     #[test]
     fn ts() {
-        assert_eq!(parse_ts(b"2026-10-03T23:58:10Z"), parse_ts(b"2026-10-03T19:58:10-04:00"));
+        assert_eq!(
+            parse_ts(b"2026-10-03T23:58:10Z"),
+            parse_ts(b"2026-10-03T19:58:10-04:00")
+        );
         assert_eq!(parse_ts(b"1791071890000"), parse_ts(b"0001791071890000"));
         assert_eq!(parse_ts(b"2026-10-03T23:58:10Z"), Some(1791071890000));
-        for bad in [&b"2028-02-30T00:00:00Z"[..], b"2027-02-29T00:00:00Z", b"2026-10-03T24:00:00Z", b"2026-10-03T23:58:10+0200", b"2026-10-03T23:58:10+24:00", b"1.5", b"-5", b""] {
+        for bad in [
+            &b"2028-02-30T00:00:00Z"[..],
+            b"2027-02-29T00:00:00Z",
+            b"2026-10-03T24:00:00Z",
+            b"2026-10-03T23:58:10+0200",
+            b"2026-10-03T23:58:10+24:00",
+            b"1.5",
+            b"-5",
+            b"",
+        ] {
             assert_eq!(parse_ts(bad), None, "{}", String::from_utf8_lossy(bad));
         }
         assert!(parse_ts(b"2028-02-29T00:00:00Z").is_some());
@@ -1156,9 +1336,29 @@ mod tok_tests {
     #[test]
     fn tokenizer_matches_split() {
         let cases: &[&str] = &[
-            "a,b", "\"a\",b", "a,\"b\"", "\"\",\"\"", ",", "a,b,c", "a", "", "\"a,b\"", "a\"b,c", "\"a\"b,c",
-            "\"a,b", "a,\"b", "\"a\"\"\",b", " a , b ", "a,b\r", "\"a\",\"b\"\r", "a,", ",b", "\"a\" ,b", "a,\"\"",
-            "x".repeat(70).leak(), "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",b",
+            "a,b",
+            "\"a\",b",
+            "a,\"b\"",
+            "\"\",\"\"",
+            ",",
+            "a,b,c",
+            "a",
+            "",
+            "\"a,b\"",
+            "a\"b,c",
+            "\"a\"b,c",
+            "\"a,b",
+            "a,\"b",
+            "\"a\"\"\",b",
+            " a , b ",
+            "a,b\r",
+            "\"a\",\"b\"\r",
+            "a,",
+            ",b",
+            "\"a\" ,b",
+            "a,\"\"",
+            "x".repeat(70).leak(),
+            "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",b",
         ];
         for pad in 0..70 {
             let mut text = String::new();
