@@ -34,7 +34,7 @@ RUN set -eu; \
         && cargo build --release --locked --offline --bin synth \
         && target/release/synth --events 2000000 --clicks 500000 --seed 99 --output /tmp/train \
         && RUSTFLAGS="$FLAGS -Cprofile-generate=/tmp/pgo" cargo build --release --locked --offline --bin pipeline --target "$HOST" --target-dir /tmp/instrumented \
-        && NCPU=4 "/tmp/instrumented/$HOST/release/pipeline" /tmp/train /tmp/train-out \
+        && SS_PROBE_CHILD=1 NCPU=4 "/tmp/instrumented/$HOST/release/pipeline" /tmp/train /tmp/train-out \
         && "$PROFDATA" merge -o /tmp/pgo.profdata /tmp/pgo \
         && RUSTFLAGS="$FLAGS -Cprofile-use=/tmp/pgo.profdata" cargo build --release --locked --offline --bin pipeline --target "$HOST"; \
     then echo "pipeline: built with profile-guided optimization"; \
@@ -43,7 +43,9 @@ RUN set -eu; \
     fi; \
     rm -rf /tmp/train /tmp/train-out /tmp/instrumented /tmp/pgo /tmp/pgo.profdata; \
     mkdir -p /rootfs/app /rootfs/data /rootfs/output /rootfs/scratch; \
-    cp "target/$HOST/release/pipeline" /rootfs/app/pipeline
+    cp "target/$HOST/release/pipeline" /rootfs/app/pipeline; \
+    RUSTFLAGS="$FLAGS" cargo build --release --locked --offline --bin synth --target "$HOST"; \
+    cp "target/$HOST/release/synth" /rootfs/app/synth
 
 # At run time the root filesystem is read-only, the user is 1000:1000 and there
 # is no network. The binary is static and writes only to $OUTPUT_DIR.

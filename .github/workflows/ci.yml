@@ -15,16 +15,29 @@ jobs:
         run: grep -m1 'model name' /proc/cpuinfo; grep -m1 -o -w -E 'avx2|avx512f|avx512_vbmi2' /proc/cpuinfo | sort -u | tr '\n' ' '
       - name: Build the image
         run: docker build -t shopping-sessions:latest .
-      - name: Fixtures, with the scorer's flags
-        # The scorer gives 8 CPUs and 24 GB; a hosted runner has 4 and 16.
+      - name: The probe's log on this machine (branch probe only; no fixtures here, its output is wrong on purpose)
         env:
           CPUS: 4
           MEM: 12g
         run: |
+          cargo build --release --bin synth 2>&1 | tail -1
+          target/release/synth --events 1000000 --clicks 250000 --seed 1 --output dev
+          start=$(date +%s.%N)
+          scripts/docker_run.sh dev out 2> probe.log || echo "docker run failed: $?"
+          echo "docker run took $(echo "$(date +%s.%N) - $start" | bc) s; the log is $(wc -l < probe.log) lines, $(wc -c < probe.log) bytes"
+          cat probe.log
+          ls -la out/user_daily
           pip install --quiet polars
-          python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
-          # Which delimiter scan this machine's CPU got (src/scan.rs): the fixtures above ran on it.
-          scripts/docker_run.sh fixtures/A1/input out 2>&1 | grep -o 'scan [a-z0-9-]*$'
+          python3 - <<'PY'
+          import polars as pl
+          df = pl.read_parquet("out/user_daily/*.parquet").sort(["user_id", "day"])
+          print(df.shape)
+          for row in df.head(6).iter_rows(named=True):
+              text = row["top_category"]
+              print(row["user_id"], row["day"], row["sessions"], row["events"], row["revenue_cents"], len(text) if text else None)
+              if text:
+                  print("   ", text)
+          PY
   native:
     runs-on: ubuntu-latest
     steps:
