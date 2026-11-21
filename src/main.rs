@@ -201,7 +201,7 @@ fn group<'a, T: Copy + Default + 'a>(
         }
     }
     unsafe { out.set_len(n) }; // every slot written: the counts sum to n
-    // hist[b] is now the end of bucket b
+                               // hist[b] is now the end of bucket b
     let mut st = 0;
     for b in 0..hist.len() - 1 {
         let e = hist[b] as usize;
@@ -727,10 +727,61 @@ fn build_links(nt: usize, dir: &Path) -> Links {
             })
         },
     );
-    let mut maps: Vec<IdMap<u32>> = (0..L).map(|_| IdMap::default()).collect();
-    let mut refs: Vec<SRef> = Vec::new();
-    let mut hs: Vec<(u64, u64)> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
+    let pairs: Vec<(SRef, u64, u64, SRef, u64, u64)> = parts.into_iter().flatten().collect();
+    // endpoints (slot = 2 * pair + side) counting-sorted into L partitions by hash, then each
+    // partition interned on its own: local ids, later offset into one global numbering
+    let ends: Vec<(u64, u64, SRef, u32)> = pairs
+        .iter()
+        .enumerate()
+        .flat_map(|(k, &(a, ah, al, b, bh, bl))| {
+            [(ah, al, a, 2 * k as u32), (bh, bl, b, 2 * k as u32 + 1)]
+        })
+        .collect();
+    let mut hist = Vec::new();
+    let ends = Parted::new(&ends, L, &mut hist, |e| e.0 as usize & (L - 1));
+    let interned = par(
+        nt,
+        L,
+        Vec::new,
+        |v: &mut Vec<(usize, Vec<(u64, u64, SRef)>, Vec<(u32, u32)>)>, u| {
+            let es = ends.get(u);
+            let mut map: IdMap<u32> = IdMap::default();
+            map.reserve(es.len());
+            let mut uniq = Vec::new();
+            let slots = es
+                .iter()
+                .map(|&(h, l, r, slot)| {
+                    let id = *map.entry(key(h, l)).or_insert_with(|| {
+                        uniq.push((h, l, r));
+                        uniq.len() as u32 - 1
+                    });
+                    (slot, id)
+                })
+                .collect();
+            v.push((u, uniq, slots));
+        },
+    );
+    let mut interned: Vec<_> = interned.into_iter().flatten().collect();
+    interned.sort_unstable_by_key(|x| x.0);
+    let mut off = vec![0u32; L + 1];
+    for (u, uniq, _) in &interned {
+        off[u + 1] = off[*u] + uniq.len() as u32;
+    }
+    let mut ids = vec![0u32; ends.data.len()];
+    for (u, _, slots) in &interned {
+        for &(slot, id) in slots {
+            ids[slot as usize] = off[*u] + id;
+        }
+    }
+    let refs: Vec<SRef> = interned
+        .iter()
+        .flat_map(|x| x.1.iter().map(|e| e.2))
+        .collect();
+    let hs: Vec<(u64, u64)> = interned
+        .iter()
+        .flat_map(|x| x.1.iter().map(|e| (e.0, e.1)))
+        .collect();
+    let mut parent: Vec<u32> = (0..refs.len() as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
             let g = p[p[x as usize] as usize];
@@ -739,25 +790,13 @@ fn build_links(nt: usize, dir: &Path) -> Links {
         }
         x
     }
-    let mut intern = |r: SRef, h: u64, l: u64, parent: &mut Vec<u32>| -> u32 {
-        *maps[h as usize & (L - 1)]
-            .entry(key(h, l))
-            .or_insert_with(|| {
-                let i = refs.len() as u32;
-                refs.push(r);
-                hs.push((h, l));
-                parent.push(i);
-                i
-            })
-    };
-    for v in &parts {
-        for &(a, ah, al, b, bh, bl) in v {
-            let ia = intern(a, ah, al, &mut parent);
-            let ib = intern(b, bh, bl, &mut parent);
-            let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
-            if ra != rb {
-                parent[ra.max(rb) as usize] = ra.min(rb);
-            }
+    for k in 0..pairs.len() {
+        let (ra, rb) = (
+            find(&mut parent, ids[2 * k]),
+            find(&mut parent, ids[2 * k + 1]),
+        );
+        if ra != rb {
+            parent[ra.max(rb) as usize] = ra.min(rb);
         }
     }
     let n = refs.len();
@@ -774,12 +813,12 @@ fn build_links(nt: usize, dir: &Path) -> Links {
         L,
         Vec::new,
         |v: &mut Vec<(usize, (usize, Vec<Slot>))>, u| {
-            let cap = (maps[u].len() * 2).next_power_of_two().max(2);
+            let uniq = &interned[u].1;
+            let cap = (uniq.len() * 2).next_power_of_two().max(2);
             let mask = cap - 1;
             let mut t = vec![Slot::default(); cap];
-            for (&k, &i) in &maps[u] {
-                let b = best[root[i as usize] as usize] as usize;
-                let (hi, lo) = ((k >> 64) as u64, k as u64);
+            for (i, &(hi, lo, _)) in uniq.iter().enumerate() {
+                let b = best[root[off[u] as usize + i] as usize] as usize;
                 let mut j = lo as usize & mask;
                 while t[j].hi != 0 || t[j].lo != 0 {
                     j = (j + 1) & mask;
