@@ -753,7 +753,12 @@ pub fn run<R: Send>(
     let event_records: usize = events.iter().map(|c| c.iter().flatten().map(|chunk| chunk.1 as usize).sum::<usize>()).sum();
     let expected_rows = event_records / 8 / threads + 64;
     let next = AtomicUsize::new(0);
+    // MEASUREMENT: per thread, ms in load, walk and write, and when it ended.
+    let phase_start = std::time::Instant::now();
+    let timings = std::sync::Mutex::new(Vec::<[f64; 4]>::new());
+    let ms = |from: std::time::Instant| from.elapsed().as_secs_f64() * 1e3;
     let results = sys::parallel(threads, |me| {
+        let (mut load_ms, mut walk_ms) = (0.0f64, 0.0f64);
         let mut group = Group { bits: setup.person_bits, ..Group::default() };
         let mut tally = Tally {
             wide: wide.clone(),
@@ -780,16 +785,32 @@ pub fn run<R: Send>(
             if events.iter().all(|c| c[partition].is_empty()) {
                 continue;
             }
+            let t = std::time::Instant::now();
             group.load(setup, &events, &clicks, partition);
+            load_ms += ms(t);
+            let t = std::time::Instant::now();
             for number in 0..group.people.len() {
                 let (e0, e1) = (group.event_start[number] as usize, group.event_start[number + 1] as usize);
                 let (c0, c1) = (group.click_start[number] as usize, group.click_start[number + 1] as usize);
                 tally.person(group.people[number], &group.events[e0..e1], &mut group.clicks[c0..c1]);
             }
+            walk_ms += ms(t);
         }
         let sessions = tally.sessions;
-        (tally.cells, finish(me, tally.rows), sessions)
+        let t = std::time::Instant::now();
+        let written = finish(me, tally.rows);
+        let write_ms = ms(t);
+        timings.lock().unwrap().push([load_ms, walk_ms, write_ms, ms(phase_start)]);
+        (tally.cells, written, sessions)
     });
+    let timings = timings.into_inner().unwrap();
+    let n = timings.len().max(1) as f64;
+    let avg = |i: usize| timings.iter().map(|t| t[i]).sum::<f64>() / n;
+    let (first, last) = timings.iter().fold((f64::MAX, 0.0f64), |(a, b), t| (a.min(t[3]), b.max(t[3])));
+    eprintln!(
+        "pipeline: inside people: load {:.1}, walk {:.1}, write {:.1} ms a thread; threads end at {first:.1} to {last:.1} ms",
+        avg(0), avg(1), avg(2)
+    );
     let mut cells = Vec::new();
     let mut finished = Vec::new();
     let mut sessions = 0;
