@@ -32,19 +32,7 @@ fn sref(s: &'static [u8]) -> SRef {
     assert!(s.len() < 1 << 16, "id too long");
     SRef(s.as_ptr() as u64 & ((1 << 48) - 1) | (s.len() as u64) << 48)
 }
-#[inline]
-fn prefetch_ptr(p: *const u8) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-    }
-}
 impl SRef {
-    #[inline]
-    fn ptr(self) -> *const u8 {
-        (self.0 & ((1 << 48) - 1)) as *const u8
-    }
     fn get(self) -> &'static [u8] {
         let len = (self.0 >> 48) as usize;
         if len == 0 {
@@ -524,7 +512,9 @@ struct E1 {
     ehi: u64,
     elo: u64,
     ingest: i64,
-    uref: SRef, // the uid; hashed in stage 2 only for survivors
+    uhi: u64,
+    ulo: u64,
+    uref: SRef,
     ts: u32,
     price: u32, // >0 only for a valid purchase
     cat: u16,
@@ -872,12 +862,15 @@ fn main() {
                             valid = false;
                         }
                         let (ehi, elo) = h128(eid);
+                        let (uhi, ulo) = if valid { h128(uid) } else { (0, 0) };
                         tmp.push(E1 {
                             ehi,
                             elo,
                             ts: if valid { (t - cws) as u32 } else { 0 },
                             ingest,
                             uref: if valid { sref(uid) } else { SRef(0) },
+                            uhi,
+                            ulo,
                             price: p,
                             cat,
                             valid,
@@ -911,15 +904,11 @@ fn main() {
                 Vec::<bool>::new(),
                 Vec::<&E1>::new(),
                 Vec::<u32>::new(),
-                (
-                    Vec::<E2>::new(),
-                    Vec::<(u64, u64)>::new(),
-                    Vec::<u32>::new(),
-                ),
+                (Vec::<E2>::new(), Vec::<u32>::new()),
                 Vec::<Parted<E2>>::new(),
             )
         },
-        |(best, dead, all, surv, (te, uh, hist), eo), bi| {
+        |(best, dead, all, surv, (te, hist), eo), bi| {
             te.clear();
             for p in bi * per..((bi + 1) * per).min(np) {
                 all.clear();
@@ -951,19 +940,13 @@ fn main() {
                 );
                 // uid hashes (prefetching uid bytes ahead), then link lookups (prefetching slots ahead)
                 let m = surv.len();
-                uh.clear();
                 for k in 0..m {
                     if k + D < m {
-                        prefetch_ptr(all[surv[k + D] as usize].uref.ptr());
-                    }
-                    uh.push(h128(all[surv[k] as usize].uref.get()));
-                }
-                for k in 0..m {
-                    if k + D < m {
-                        links.prefetch(uh[k + D].0, uh[k + D].1);
+                        let r = all[surv[k + D] as usize];
+                        links.prefetch(r.uhi, r.ulo);
                     }
                     let r = all[surv[k] as usize];
-                    let (phi, plo, nref) = links.person(uh[k].0, uh[k].1, r.uref);
+                    let (phi, plo, nref) = links.person(r.uhi, r.ulo, r.uref);
                     te.push(E2 {
                         phi,
                         plo,
