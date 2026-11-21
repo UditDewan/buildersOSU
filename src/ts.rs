@@ -330,11 +330,11 @@ static MINUTES: [u32; 256] = clock_table(59, 60);
 /// no register, no move (BENCH.md, experiment 43).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[repr(C, align(32))]
-struct InPlace([u8; 32]);
+pub(crate) struct InPlace([u8; 32]);
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 impl InPlace {
-    const fn bytes(bytes: [u8; 32]) -> Self {
+    pub(crate) const fn bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
@@ -352,7 +352,7 @@ impl InPlace {
     }
 
     #[inline(always)]
-    fn read(&'static self) -> std::arch::x86_64::__m256i {
+    pub(crate) fn read(&'static self) -> std::arch::x86_64::__m256i {
         unsafe { std::ptr::read_volatile(self as *const Self as *const std::arch::x86_64::__m256i) }
     }
 }

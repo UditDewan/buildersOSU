@@ -236,30 +236,45 @@ unsafe fn pack_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len: usize
         _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128(first as *const __m128i)), _mm_loadu_si128(second as *const __m128i), 1)
     };
     let twice = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i));
+    // The constants that are an instruction's last operand are read in place
+    // (`ts::InPlace`): a memory operand each, no register held across the line
+    // loop and no broadcast on every line (BENCH.md, item 6 (v)). The three
+    // shuffle tables cannot be: `vpshufb` takes memory only for its index.
+    use crate::ts::InPlace;
+    static NIBBLE: InPlace = InPlace::bytes([0x0f; 32]);
+    static UNDERSCORE: InPlace = InPlace::bytes([b'_'; 32]);
+    static LESS_FOUR: InPlace = InPlace::bytes([0xfc; 32]);
+    // 0x0140 as words (64, then 1) and 0x0001_1000 as dwords (4096, then 1), low byte first.
+    static BY_64: InPlace = InPlace::bytes(repeat(&[0x40, 0x01]));
+    static BY_4096: InPlace = InPlace::bytes(repeat(&[0x00, 0x10, 0x01, 0x00]));
+    // The key is the first four's 24 bits, the second's, and the 12 bits of
+    // characters 8 and 9, with four zero bits below: as bytes, lowest first,
+    // the upper two of the third four, then all three of the second and of the first.
+    static ORDER: InPlace = InPlace::bytes(repeat(&[9, 10, 4, 5, 6, 0, 1, 2, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+    const fn repeat(unit: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut at = 0;
+        while at < 32 {
+            out[at] = unit[at % unit.len()];
+            at += 1;
+        }
+        out
+    }
     let bytes = both(a, b);
     let keep = both(LENGTH_MASKS.as_ptr().add(16 - a_len), LENGTH_MASKS.as_ptr().add(16 - b_len));
-    let nibble = _mm256_set1_epi8(0x0f);
-    let high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), nibble);
-    let low = _mm256_and_si256(bytes, nibble);
+    let high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), NIBBLE.read());
+    let low = _mm256_and_si256(bytes, NIBBLE.read());
     let outside = _mm256_and_si256(_mm256_shuffle_epi8(twice(&OUTSIDE_BY_HIGH), high), _mm256_shuffle_epi8(twice(&OUTSIDE_BY_LOW), low));
     if _mm256_testz_si256(outside, keep) == 0 {
         return None;
     }
-    let underscore = _mm256_and_si256(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'_' as i8)), _mm256_set1_epi8(-4));
+    let underscore = _mm256_and_si256(_mm256_cmpeq_epi8(bytes, UNDERSCORE.read()), LESS_FOUR.read());
     let codes = _mm256_add_epi8(_mm256_add_epi8(bytes, _mm256_shuffle_epi8(twice(&CODE_OFFSET), high)), underscore);
     let codes = _mm256_and_si256(codes, keep);
     // Characters 0 to 3, 4 to 7 and 8 to 11 of each ID as 24 bits each, the first character highest.
-    let pairs = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0140));
-    let fours = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_1000));
-    // The key is the first four's 24 bits, the second's, and the 12 bits of
-    // characters 8 and 9, with four zero bits below: as bytes, lowest first,
-    // the upper two of the third four, then all three of the second and of the first.
-    #[rustfmt::skip]
-    let order = _mm256_setr_epi8(
-        9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1,
-        9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1,
-    );
-    let keys = _mm256_shuffle_epi8(fours, order);
+    let pairs = _mm256_maddubs_epi16(codes, BY_64.read());
+    let fours = _mm256_madd_epi16(pairs, BY_4096.read());
+    let keys = _mm256_shuffle_epi8(fours, ORDER.read());
     Some((_mm256_extract_epi64(keys, 0) as u64, _mm256_extract_epi64(keys, 2) as u64))
 }
 
