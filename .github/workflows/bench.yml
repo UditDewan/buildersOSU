@@ -28,6 +28,9 @@ on:
       sweep_threads:
         description: Thread counts for the sweep
         default: "4 1"
+      generator:
+        description: Who writes the timed dataset, synth (src/bin/synth.rs) or organizers (pgo/generator)
+        default: "synth"
 
 jobs:
   bench:
@@ -54,7 +57,15 @@ jobs:
         run: |
           cargo build --release --bin synth --bin reference 2>&1 | tail -1
           target/release/synth --events 2000000 --clicks 500000 --seed 5 --output small
-          target/release/synth --events ${{ inputs.events }} --clicks $(( ${{ inputs.events }} / 4 )) --seed 9 --output data
+          # The organizers' generator writes the data the scorer's is made like; the
+          # PGO build (Dockerfile) trains on synth, and this is how to see that it
+          # is not only synth's data it is faster on.
+          if [ "${{ inputs.generator }}" = organizers ]; then
+            (cd pgo/generator && cargo build --release 2>&1 | tail -1)
+            pgo/generator/target/release/generate --seed 9 --events ${{ inputs.events }} --clicks $(( ${{ inputs.events }} / 4 )) --output data
+          else
+            target/release/synth --events ${{ inputs.events }} --clicks $(( ${{ inputs.events }} / 4 )) --seed 9 --output data
+          fi
           du -sh data/events data/clicks data/links
       - name: Both agree with the reference on a 2M-event set
         run: |
