@@ -36,7 +36,8 @@ impl Earliest {
         self.mask = capacity - 1;
     }
 
-    /// Takes one more copy; `hash` is any hash of its event key. If a copy of
+    /// Takes one more copy; `hash` is `sys::mix` of its event key, whose bits
+    /// from 20 up place it (its low bits are not mixed). If a copy of
     /// the same event is already here, the later of the two loses (the new one,
     /// if their `ingest_ts` are equal: then they are identical), the earlier one
     /// stays, and the loser's `at` is returned, which may be `NO_EVENT`.
@@ -48,7 +49,7 @@ impl Earliest {
     /// another event, which the table's size keeps rare.
     #[inline(always)]
     fn meet(&mut self, copy: Copy_, hash: u64) -> u32 {
-        let mut at = hash as usize & self.mask;
+        let mut at = (hash >> 20) as usize & self.mask;
         loop {
             let held = unsafe { self.slots.get_unchecked_mut(at) };
             let same = held.event == copy.event;
@@ -147,7 +148,8 @@ pub fn run(
             unsafe { suspects.set_len(found) };
             earliest.reset(found);
             for copy in &suspects {
-                // The filter's slot came from the hash's high bits; the table takes its low ones.
+                // The filter's slot came from the hash's high bits; the table takes bits from 20 up,
+                // which lie below those at the sizes a run has (and are only slower if they do not).
                 let lost = earliest.meet(*copy, sys::mix(copy.event));
                 // The loser's event record is marked dropped. Most copies lose to
                 // nothing, or have no record: those mark a scratch word instead.

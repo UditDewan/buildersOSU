@@ -254,9 +254,15 @@ pub fn prefetch<T>(at: *const T) {
     let _ = at;
 }
 
-/// One multiply, all 64 bits mixed: the two halves of a 128-bit product folded together.
+/// One 64-bit multiply by an odd constant (BENCH.md, experiment 58). Bit `i` of
+/// the product depends on bits `0..=i` of the key, so the high bits depend on all
+/// of it and the low bits only on its low bits, which for a packed key are a
+/// constant tag. Every use takes high bits (partitions, table homes) or bits from
+/// 20 up (dedup's table), never the low ones. It is a bijection: two keys collide
+/// in no bit range more than chance makes them. Was a 128-bit product folded in
+/// two, about five instructions where this is one or two, run five or six times
+/// for every event.
 #[inline(always)]
 pub fn mix(key: u64) -> u64 {
-    let product = u128::from(key ^ 0x2d35_8dcc_aa6c_78a5) * 0x8bb8_4b93_962e_acc9_u128;
-    (product as u64) ^ ((product >> 64) as u64)
+    key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
