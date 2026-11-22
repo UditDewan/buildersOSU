@@ -36,6 +36,37 @@ fn setting(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
 }
 
+/// A sample of a dataset's long IDs for `key::learn_long_ids`: the first two
+/// fields of the lines in the first 256 KB of the two largest files of each
+/// folder, quotes around a whole field left out, those of a long ID's length.
+/// A line cut off at the end, or anything else odd, is one more sample that
+/// either fits or does not: learning goes by what most of them share.
+fn id_sample(folders: &[&[reader::Input]]) -> Vec<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut sample = Vec::new();
+    for inputs in folders {
+        let mut largest: Vec<&reader::Input> = inputs.iter().collect();
+        largest.sort_by_key(|input| std::cmp::Reverse(input.len));
+        for input in largest.into_iter().take(2) {
+            let mut bytes = vec![0u8; input.len.min(256 << 10) as usize];
+            let got = input.file.read_at(&mut bytes, 0).unwrap_or(0);
+            bytes.truncate(got);
+            for line in bytes.split(|&byte| byte == b'\n').skip(1) {
+                for field in line.split(|&byte| byte == b',').take(2) {
+                    let field = match field {
+                        [b'"', inner @ .., b'"'] => inner,
+                        _ => field,
+                    };
+                    if field.len() == key::LONG_LEN {
+                        sample.push(field.to_vec());
+                    }
+                }
+            }
+        }
+    }
+    sample
+}
+
 /// PLAIN encoding of strings: a 4-byte length before each.
 fn plain(values: impl Iterator<Item = impl AsRef<[u8]>>, out: &mut Vec<u8>) {
     for value in values {
@@ -166,6 +197,8 @@ fn main() {
     let link_files = reader::open_folder(&data.join("links"));
     let event_bytes: u64 = events.iter().map(|i| i.len).sum();
     let click_bytes: u64 = clicks.iter().map(|i| i.len).sum();
+    // Which long IDs get keys of their own (key::long_key), before any line is parsed.
+    key::learn_long_ids(id_sample(&[&events, &clicks, &link_files]).iter().map(|id| id.as_slice()));
 
     // The small files on one thread while the others join the linked IDs.
     let ((catalog, catalog_ms), links) = std::thread::scope(|scope| {

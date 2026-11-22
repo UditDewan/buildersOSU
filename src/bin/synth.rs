@@ -43,6 +43,27 @@ fn scramble(value: u64, key: u64) -> u64 {
     mixed.wrapping_mul(0xD6E8_FEB8_6659) & MASK
 }
 
+/// An ID's characters after its first, as the organizers' generator of
+/// 2026-11-21 writes them (`write_id_suffix`): for one scrambled value in
+/// eight, 32 lowercase hex digits (a SplitMix64 finalizer of the value and a
+/// key, twice), otherwise base 36. Its scramble is a keyed Feistel network
+/// where this keeps the old one: what a pipeline sees of it is the same.
+fn suffix(out: &mut Vec<u8>, value: u64, key: u64) {
+    let scrambled = scramble(value, key);
+    if scrambled & 7 == 0 {
+        let mix64 = |mut z: u64| {
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let high = mix64(scrambled ^ key ^ 0x236B_C018_7B12_9111);
+        let low = mix64(scrambled ^ key.rotate_left(32) ^ 0x5594_E178_7A20_2222);
+        out.extend_from_slice(format!("{high:016x}{low:016x}").as_bytes());
+    } else {
+        base36(out, scrambled);
+    }
+}
+
 fn base36(out: &mut Vec<u8>, mut value: u64) {
     let mut buffer = [0u8; 13];
     let mut at = buffer.len();
@@ -180,7 +201,7 @@ fn main() {
     let mut click_parts = Parts::new(&mut rng, 24);
     let mut link_parts = Parts::new(&mut rng, 12);
     let clicks_per_session = clicks as f64 / (events as f64 / 5.5 * 0.65);
-    let kiosks: Vec<Vec<u8>> = (0..4).map(|k| { let mut id = b"u".to_vec(); base36(&mut id, scramble((1 << 39) + k, user_key)); id }).collect();
+    let kiosks: Vec<Vec<u8>> = (0..4).map(|k| { let mut id = b"u".to_vec(); suffix(&mut id, (1 << 39) + k, user_key); id }).collect();
 
     let (mut event_index, mut click_index) = (0u64, 0u64);
     let mut running = 0.0;
@@ -205,7 +226,7 @@ fn main() {
             75..88 => 3,
             _ => rng.between(4, 8),
         } as usize;
-        let ids: Vec<Vec<u8>> = (0..aliases).map(|a| { let mut id = b"u".to_vec(); base36(&mut id, scramble(user as u64 * 512 + a as u64, user_key)); id }).collect();
+        let ids: Vec<Vec<u8>> = (0..aliases).map(|a| { let mut id = b"u".to_vec(); suffix(&mut id, user as u64 * 512 + a as u64, user_key); id }).collect();
         for alias in 1..aliases {
             let earlier = rng.below(alias as u64) as usize;
             for _ in 0..1 + usize::from(rng.chance(0.08)) {
@@ -243,7 +264,7 @@ fn main() {
                 let alias = if aliases == 1 || rng.chance(0.5) { 0 } else { rng.below(aliases as u64) as usize };
                 fields[0].clear();
                 fields[0].push(b'e');
-                base36(&mut fields[0], scramble(event_index, event_key));
+                suffix(&mut fields[0], event_index, event_key);
                 event_index += 1;
                 fields[1].clear();
                 if !rng.chance(0.002) {
@@ -305,7 +326,7 @@ fn main() {
                 let alias = if aliases == 1 || rng.chance(0.5) { 0 } else { rng.below(aliases as u64) as usize };
                 let mut row: Vec<Vec<u8>> = vec![Vec::new(); 4];
                 row[0].push(b'k');
-                base36(&mut row[0], scramble(click_index, click_key));
+                suffix(&mut row[0], click_index, click_key);
                 click_index += 1;
                 row[1].extend_from_slice(&ids[alias]);
                 let campaign = if rng.chance(0.3) { 1 + rng.below(4) } else if rng.chance(0.005) { 2_001 + rng.below(100) } else {

@@ -6,16 +6,74 @@
 //! comparing the IDs byte by byte: the order rules.md asks for when it names a
 //! person or breaks a tie between clicks.
 //!
-//! Every ID the generator writes fits. Anything else (longer, or holding a
+//! The generator's long IDs, one character and 32 lowercase hex digits (one ID
+//! in eight since the generator of 2026-11-21), get keys of their own that hold
+//! the ID exactly in 48 bits (`long_key`). Anything else (longer, or holding a
 //! space, a tab, a `\r`, non-ASCII) is "exotic": interned in a table and given
 //! a key with the low tag bit set. That path is slow and exact; it exists so
 //! the rules hold for any input, not because scored data takes it.
+//!
+//! The low four bits of a key say its kind: 0000 packed, 0001 interned, 0011
+//! long. (0010 is taken by the link table's parent pointers.)
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as Atomic};
 use std::sync::{LazyLock, Mutex};
 
 pub type Key = u64;
+
+/// The tag of a long ID's key (`long_key`).
+const LONG: u64 = 3;
+/// The length of a long ID: one character, then 32 hex digits.
+pub const LONG_LEN: usize = 33;
+const LOW_40: u64 = (1 << 40) - 1;
+/// What `LONG_TOP` holds for a first character no long ID has been seen with:
+/// `z >> 40` is at most 2^24 - 1, so it never matches.
+const UNKNOWN: u64 = u64::MAX;
+
+/// The generator's 64-bit mixer (the finalizer of SplitMix64), which writes each
+/// half of a long ID's hex digits, and its inverse. Both are bijections.
+const MIX_A: u64 = 0xbf58_476d_1ce4_e5b9;
+const MIX_B: u64 = 0x94d0_49bb_1331_11eb;
+
+/// The inverse of an odd number modulo 2^64, by Newton's iteration (each step doubles the bits that are right).
+const fn inverse(m: u64) -> u64 {
+    let mut x = m; // right to 3 bits: m * m = 1 modulo 8 for every odd m
+    let mut step = 0;
+    while step < 5 {
+        x = x.wrapping_mul(2u64.wrapping_sub(m.wrapping_mul(x)));
+        step += 1;
+    }
+    x
+}
+const MIX_A_INVERSE: u64 = inverse(MIX_A);
+const MIX_B_INVERSE: u64 = inverse(MIX_B);
+
+#[inline(always)]
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(MIX_A);
+    z = (z ^ (z >> 27)).wrapping_mul(MIX_B);
+    z ^ (z >> 31)
+}
+
+/// `mix64` backwards: each xor-shift undone by xoring in the shifts of the
+/// result until they fall off the end, each multiply by the inverse.
+#[inline(always)]
+fn unmix64(mut z: u64) -> u64 {
+    z ^= (z >> 31) ^ (z >> 62);
+    z = z.wrapping_mul(MIX_B_INVERSE);
+    z ^= (z >> 27) ^ (z >> 54);
+    z = z.wrapping_mul(MIX_A_INVERSE);
+    z ^ (z >> 30) ^ (z >> 60)
+}
+
+/// Per first character of a long ID, the two numbers every long ID the
+/// generator writes with that character shares: the top 24 bits of `z` and
+/// `z ^ w`, where `z` and `w` are the two halves of its hex digits unmixed
+/// (`learn_long_ids`). Set before any line is parsed, read-only afterwards.
+static LONG_TOP: [AtomicU64; 256] = [const { AtomicU64::new(UNKNOWN) }; 256];
+static LONG_XOR: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 
 const fn encode_table() -> [u8; 256] {
     let mut table = [0u8; 256];
@@ -192,9 +250,133 @@ pub unsafe fn pack_padded(id: *const u8, len: usize) -> Key {
 pub unsafe fn key_of_padded(id: *const u8, len: usize) -> Key {
     let key = pack_padded(id, len);
     if key != 0 {
-        key
-    } else {
-        intern(std::slice::from_raw_parts(id, len))
+        return key;
+    }
+    if len == LONG_LEN {
+        let key = long_key(id);
+        if key != 0 {
+            return key;
+        }
+    }
+    intern(std::slice::from_raw_parts(id, len))
+}
+
+/// The two 64-bit halves of 32 lowercase hex digits (`0-9a-f` only: `A` is
+/// not `a` in an ID), the first digit highest; `None` for any other byte.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn hex_halves(digits: *const u8) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    let bytes = _mm256_loadu_si256(digits as *const __m256i);
+    // A digit's value and a letter's, each in range exactly when the byte is one (unsigned, via the minimum).
+    let digit = _mm256_sub_epi8(bytes, _mm256_set1_epi8(b'0' as i8));
+    let letter = _mm256_sub_epi8(bytes, _mm256_set1_epi8(b'a' as i8));
+    let is_digit = _mm256_cmpeq_epi8(_mm256_min_epu8(digit, _mm256_set1_epi8(9)), digit);
+    let is_letter = _mm256_cmpeq_epi8(_mm256_min_epu8(letter, _mm256_set1_epi8(5)), letter);
+    if _mm256_movemask_epi8(_mm256_or_si256(is_digit, is_letter)) != -1 {
+        return None;
+    }
+    let nibbles = _mm256_blendv_epi8(_mm256_add_epi8(letter, _mm256_set1_epi8(10)), digit, is_digit);
+    // Each pair of digits to one byte, the first digit high: a word of 16 times the first plus the second.
+    let pairs = _mm256_maddubs_epi16(nibbles, _mm256_set1_epi16(0x0110));
+    // Within each 128-bit half, the eight words to eight bytes: the first half's are the first 16 digits.
+    let bytes = _mm256_packus_epi16(pairs, pairs);
+    let high = _mm_cvtsi128_si64(_mm256_castsi256_si128(bytes)) as u64;
+    let low = _mm_cvtsi128_si64(_mm256_extracti128_si256(bytes, 1)) as u64;
+    Some((high.swap_bytes(), low.swap_bytes()))
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn hex_halves(digits: *const u8) -> Option<(u64, u64)> {
+    hex_halves_of(std::slice::from_raw_parts(digits, 32))
+}
+
+/// `hex_halves` one digit at a time: what it is defined as.
+fn hex_halves_of(digits: &[u8]) -> Option<(u64, u64)> {
+    let mut halves = [0u64; 2];
+    for (at, &byte) in digits.iter().take(32).enumerate() {
+        let value = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => return None,
+        };
+        halves[at / 16] = (halves[at / 16] << 4) | u64::from(value);
+    }
+    Some((halves[0], halves[1]))
+}
+
+/// The key of a long ID: one character and 32 lowercase hex digits at `id`
+/// (all 33 readable), or 0 if it is not one, or not like the long IDs this
+/// dataset's sample had (`learn_long_ids`). Then it is interned like any other.
+///
+/// The generator writes the digits as `mix64(s ^ k0 ^ c0)` and
+/// `mix64(s ^ k1 ^ c1)` for a 40-bit `s` and a dataset's secret `k0`, `k1`.
+/// Unmixed, the two halves are `z` and `w`: `z` above its 40 low bits, and `z ^ w`,
+/// are the same for every long ID of a dataset with the same first character.
+/// An ID that has both is fully given by its first character and those 40
+/// bits (`long_text` writes it back from them), so the key is exact for every
+/// ID it is given to, whoever wrote it: two different such IDs cannot share one.
+#[inline(always)]
+unsafe fn long_key(id: *const u8) -> Key {
+    let first = *id;
+    let Some((high, low)) = hex_halves(id.add(1)) else {
+        return 0;
+    };
+    let (z, w) = (unmix64(high), unmix64(low));
+    let top = LONG_TOP[first as usize].load(Atomic::Relaxed);
+    let xor = LONG_XOR[first as usize].load(Atomic::Relaxed);
+    if z >> 40 != top || z ^ w != xor {
+        return 0;
+    }
+    (u64::from(first) << 56) | ((z & LOW_40) << 16) | LONG
+}
+
+/// The ID a long key stands for: its first character and 32 hex digits.
+fn long_text(key: Key) -> [u8; LONG_LEN] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let first = (key >> 56) as u8;
+    let z = (LONG_TOP[first as usize].load(Atomic::Relaxed) << 40) | ((key >> 16) & LOW_40);
+    let w = z ^ LONG_XOR[first as usize].load(Atomic::Relaxed);
+    let mut text = [0u8; LONG_LEN];
+    text[0] = first;
+    for (half, value) in [mix64(z), mix64(w)].into_iter().enumerate() {
+        for digit in 0..16 {
+            text[1 + 16 * half + digit] = HEX[((value >> (60 - 4 * digit)) & 15) as usize];
+        }
+    }
+    text
+}
+
+/// Learns from a sample of a dataset's IDs which long IDs get keys of their own:
+/// per first character, the pair (`z >> 40`, `z ^ w`) most of its long IDs share
+/// (see `long_key`), if at least two do. Call once, before any line is parsed.
+/// What it learns only decides which long IDs take the fast way: any choice
+/// gives the same keys to the same IDs and different keys to different ones.
+pub fn learn_long_ids<'a>(sample: impl IntoIterator<Item = &'a [u8]>) {
+    let mut seen: HashMap<(u8, u64, u64), usize> = HashMap::new();
+    for id in sample {
+        if id.len() != LONG_LEN {
+            continue;
+        }
+        if let Some((high, low)) = hex_halves_of(&id[1..]) {
+            let (z, w) = (unmix64(high), unmix64(low));
+            *seen.entry((id[0], z >> 40, z ^ w)).or_default() += 1;
+        }
+    }
+    // The most common pair per first character; a tie goes to the smaller pair, so the choice is the same every run.
+    let mut best: HashMap<u8, (usize, u64, u64)> = HashMap::new();
+    for ((first, top, xor), count) in seen {
+        let held = best.entry(first).or_insert((0, top, xor));
+        if count > held.0 || (count == held.0 && (top, xor) < (held.1, held.2)) {
+            *held = (count, top, xor);
+        }
+    }
+    for (first, (count, top, xor)) in best {
+        if count >= 2 {
+            LONG_TOP[first as usize].store(top, Atomic::Relaxed);
+            LONG_XOR[first as usize].store(xor, Atomic::Relaxed);
+        }
     }
 }
 
@@ -322,15 +504,25 @@ fn intern(id: &[u8]) -> Key {
 pub fn key_of(id: &[u8]) -> Key {
     let key = pack(id);
     if key != 0 {
-        key
-    } else {
-        intern(id)
+        return key;
     }
+    if id.len() == LONG_LEN {
+        let key = unsafe { long_key(id.as_ptr()) };
+        if key != 0 {
+            return key;
+        }
+    }
+    intern(id)
 }
 
 #[inline(always)]
 fn is_packed(key: Key) -> bool {
     key & 15 == 0
+}
+
+#[inline(always)]
+fn is_long(key: Key) -> bool {
+    key & 15 == LONG
 }
 
 /// Appends the ID a key stands for.
@@ -342,6 +534,8 @@ pub fn write_id(key: Key, out: &mut Vec<u8>) {
             out.push(DECODE[(rest >> 58) as usize]);
             rest <<= 6;
         }
+    } else if is_long(key) {
+        out.extend_from_slice(&long_text(key));
     } else {
         out.extend_from_slice(&EXOTIC.lock().unwrap().ids[(key >> 4) as usize]);
     }
@@ -412,15 +606,52 @@ fn make_room(out: &mut Vec<u8>) {
 #[cold]
 #[inline(never)]
 fn push_plain_exotic(key: Key, out: &mut Vec<u8>) {
+    if is_long(key) {
+        out.extend_from_slice(&(LONG_LEN as u32).to_le_bytes());
+        out.extend_from_slice(&long_text(key));
+        return;
+    }
     let exotic = EXOTIC.lock().unwrap();
     let id = &exotic.ids[(key >> 4) as usize];
     out.extend_from_slice(&(id.len() as u32).to_le_bytes());
     out.extend_from_slice(id);
 }
 
+/// The characters of a packed or long key, into `out`; their count. `None` for an interned key.
+fn text_of(key: Key, out: &mut [u8; LONG_LEN]) -> Option<usize> {
+    if is_long(key) {
+        *out = long_text(key);
+        Some(LONG_LEN)
+    } else if is_packed(key) {
+        let mut len = 0;
+        let mut rest = key;
+        while rest != 0 {
+            out[len] = DECODE[(rest >> 58) as usize];
+            rest <<= 6;
+            len += 1;
+        }
+        Some(len)
+    } else {
+        None
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn compare_slow(a: Key, b: Key) -> Ordering {
+    // Two long IDs with one first character: fixed-width lowercase hex sorts as the numbers it spells.
+    if is_long(a) && is_long(b) && a >> 56 == b >> 56 {
+        let numbers = |key: Key| {
+            let first = (key >> 56) as usize;
+            let z = (LONG_TOP[first].load(Atomic::Relaxed) << 40) | ((key >> 16) & LOW_40);
+            (mix64(z), mix64(z ^ LONG_XOR[first].load(Atomic::Relaxed)))
+        };
+        return numbers(a).cmp(&numbers(b));
+    }
+    let (mut x, mut y) = ([0u8; LONG_LEN], [0u8; LONG_LEN]);
+    if let (Some(x_len), Some(y_len)) = (text_of(a, &mut x), text_of(b, &mut y)) {
+        return x[..x_len].cmp(&y[..y_len]);
+    }
     let (mut x, mut y) = (Vec::new(), Vec::new());
     write_id(a, &mut x);
     write_id(b, &mut y);
@@ -657,6 +888,142 @@ mod tests {
                 assert_eq!(compare(key_of(a), key_of(b)), a.cmp(b), "{a:?} vs {b:?}");
                 assert_eq!(key_of(a) == key_of(b), a == b);
             }
+        }
+    }
+
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A long ID as the generator of 2026-11-21 writes one (`write_id_suffix`
+    /// in its text.rs): `first`, then `mix64` of the 40-bit `s` xored with two
+    /// secret words and two constants, as 32 lowercase hex digits.
+    fn generated(first: u8, s: u64, secret: [u64; 2]) -> Vec<u8> {
+        let high = mix64(s ^ secret[0] ^ 0x236B_C018_7B12_9111);
+        let low = mix64(s ^ secret[1] ^ 0x5594_E178_7A20_2222);
+        let mut id = vec![first];
+        id.extend_from_slice(format!("{high:016x}{low:016x}").as_bytes());
+        id
+    }
+
+    #[test]
+    fn the_generators_mixer_comes_undone() {
+        let mut state = 7;
+        for value in [0, 1, u64::MAX, 1 << 63, 0x0123_4567_89ab_cdef] {
+            assert_eq!(unmix64(mix64(value)), value);
+            assert_eq!(mix64(unmix64(value)), value);
+        }
+        for _ in 0..100_000 {
+            let value = next(&mut state);
+            assert_eq!(unmix64(mix64(value)), value);
+        }
+        assert_eq!(MIX_A.wrapping_mul(MIX_A_INVERSE), 1);
+        assert_eq!(MIX_B.wrapping_mul(MIX_B_INVERSE), 1);
+    }
+
+    /// The vector reading of 32 hex digits is the definition, for every byte in every place.
+    #[test]
+    fn hex_digits_are_read_as_defined() {
+        let mut state = 8;
+        let digits = b"0123456789abcdef";
+        for round in 0..20_000 {
+            let mut text: Vec<u8> = (0..32).map(|_| digits[(next(&mut state) % 16) as usize]).collect();
+            if round % 2 == 1 {
+                // One byte anything at all: most often not a digit.
+                text[(next(&mut state) % 32) as usize] = (next(&mut state) % 256) as u8;
+            }
+            assert_eq!(unsafe { hex_halves(text.as_ptr()) }, hex_halves_of(&text), "{text:?}");
+        }
+        for place in 0..32 {
+            for byte in 0..=255u8 {
+                let mut text = vec![b'7'; 32];
+                text[place] = byte;
+                let expected = hex_halves_of(&text);
+                assert_eq!(expected.is_some(), byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+                assert_eq!(unsafe { hex_halves(text.as_ptr()) }, expected, "byte {byte} at {place}");
+            }
+        }
+    }
+
+    /// Long IDs like the generator's get long keys, which hold them exactly: they
+    /// spell them back, are equal exactly when the IDs are, and sort as their
+    /// bytes do among packed, interned and other long keys. Long IDs not like
+    /// the sample's, or not all lowercase hex, are interned instead.
+    #[test]
+    fn long_ids_get_exact_keys_and_sort_by_their_bytes() {
+        let mut state = 9;
+        // First characters no other test gives long IDs: the table they learn into is shared.
+        let (users, events) = ([next(&mut state), next(&mut state)], [next(&mut state), next(&mut state)]);
+        let mut long: Vec<Vec<u8>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while long.len() < 3_000 {
+            let s = next(&mut state) & LOW_40;
+            if seen.insert(s) {
+                long.push(generated(b'v', s, users));
+                if long.len() % 3 == 0 {
+                    long.push(generated(b'f', s, events)); // the same s for another kind: another ID
+                }
+            }
+        }
+        // A sample with noise in it: short IDs, a different secret, odd lengths.
+        let mut sample: Vec<Vec<u8>> = long.iter().step_by(7).cloned().collect();
+        sample.push(generated(b'v', 5, [1, 2]));
+        sample.push(b"v123".to_vec());
+        sample.push(b"vxyz0123456789abcdef0123456789abcde".to_vec());
+        learn_long_ids(sample.iter().map(|id| id.as_slice()));
+        for id in &long {
+            let key = key_of(id);
+            assert!(is_long(key), "{}", String::from_utf8_lossy(id));
+            assert_eq!(key, key_of(id));
+            let mut back = Vec::new();
+            write_id(key, &mut back);
+            assert_eq!(&back, id);
+            let mut plain = Vec::new();
+            push_plain(key, &mut plain);
+            assert_eq!(&plain[..4], &(LONG_LEN as u32).to_le_bytes());
+            assert_eq!(&plain[4..], id.as_slice());
+        }
+        let keys: std::collections::HashSet<Key> = long.iter().map(|id| key_of(id)).collect();
+        assert_eq!(keys.len(), long.len(), "two long IDs share a key");
+        // Interned instead: another secret, capitals, random hex, a byte off.
+        let mut capital = long[0].clone();
+        capital.make_ascii_uppercase();
+        let mut off = long[1].clone();
+        off[32] = if off[32] == b'0' { b'1' } else { b'0' };
+        let mut not_hex = long[2].clone();
+        not_hex[10] = b'g';
+        let random: Vec<u8> = std::iter::once(b'v').chain((0..32).map(|_| b"0123456789abcdef"[(next(&mut state) % 16) as usize])).collect();
+        let others = [generated(b'v', 77, [3, 4]), capital, off, not_hex, random, generated(b'w', 12, users)];
+        for id in &others {
+            assert_eq!(key_of(id) & 15, 1, "{} should be interned", String::from_utf8_lossy(id));
+        }
+        // Order and equality across every kind of key.
+        let mut mixed: Vec<Vec<u8>> = long.iter().take(300).cloned().collect();
+        mixed.extend(others.iter().cloned());
+        for short in [&b"v"[..], b"v0", b"v9", b"va", b"vf", b"vz", b"v0123456789", b"f", b"fff", b"V1", b"w", b"v 1", b"v_"] {
+            mixed.push(short.to_vec());
+        }
+        mixed.push(long[5][..20].to_vec()); // a prefix of a long ID
+        for a in &mixed {
+            for b in &mixed {
+                let (x, y) = (key_of(a), key_of(b));
+                assert_eq!(compare(x, y), a.cmp(b), "{} vs {}", String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+                assert_eq!(x == y, a == b);
+            }
+        }
+        // Two at a time, as a line gives them, each with the reader's readable bytes behind it.
+        for pair in mixed.windows(2) {
+            let mut a = pair[0].clone();
+            let mut b = pair[1].clone();
+            let (a_len, b_len) = (a.len(), b.len());
+            a.resize(a_len + 40, b',');
+            b.resize(b_len + 40, b',');
+            let keys = unsafe { keys_of_two_padded(a.as_ptr(), a_len, b.as_ptr(), b_len) };
+            assert_eq!(keys, (key_of(&pair[0]), key_of(&pair[1])));
         }
     }
 }
