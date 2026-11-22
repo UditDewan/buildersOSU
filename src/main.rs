@@ -37,7 +37,7 @@ fn setting(name: &str) -> Option<usize> {
 }
 
 /// A sample of a dataset's long IDs for `key::learn_long_ids`: the first two
-/// fields of the lines in the first 256 KB of the two largest files of each
+/// fields of the lines in the first 64 KB of the two largest files of each
 /// folder, quotes around a whole field left out, those of a long ID's length.
 /// A line cut off at the end, or anything else odd, is one more sample that
 /// either fits or does not: learning goes by what most of them share.
@@ -48,7 +48,7 @@ fn id_sample(folders: &[&[reader::Input]]) -> Vec<Vec<u8>> {
         let mut largest: Vec<&reader::Input> = inputs.iter().collect();
         largest.sort_by_key(|input| std::cmp::Reverse(input.len));
         for input in largest.into_iter().take(2) {
-            let mut bytes = vec![0u8; input.len.min(256 << 10) as usize];
+            let mut bytes = vec![0u8; input.len.min(64 << 10) as usize];
             let got = input.file.read_at(&mut bytes, 0).unwrap_or(0);
             bytes.truncate(got);
             for line in bytes.split(|&byte| byte == b'\n').skip(1) {
