@@ -421,6 +421,29 @@ fn click_order(a: &[u64; 2], b: &[u64; 2]) -> std::cmp::Ordering {
     (a[0] >> 32).cmp(&(b[0] >> 32)).then_with(|| key::compare(b[1], a[1]))
 }
 
+/// A person's clicks into `click_order` (BENCH.md, experiment 61): sorted by
+/// their first word alone, a plain integer (time above, campaign below), then
+/// each run of clicks at one instant, which few people have, put in
+/// `click_order` on its own. Two clicks `click_order` calls equal are copies
+/// of one click: the same in every word, so it does not matter which goes first.
+fn sort_clicks(clicks: &mut [[u64; 2]]) {
+    clicks.sort_unstable_by_key(|click| click[0]);
+    let mut at = 1;
+    while at < clicks.len() {
+        if clicks[at][0] >> 32 != clicks[at - 1][0] >> 32 {
+            at += 1;
+            continue;
+        }
+        let start = at - 1;
+        let mut end = at + 1;
+        while end < clicks.len() && clicks[end][0] >> 32 == clicks[start][0] >> 32 {
+            end += 1;
+        }
+        clicks[start..end].sort_unstable_by(click_order);
+        at = end;
+    }
+}
+
 /// The clicks of a person with at most `FEW` of them, in `click_order`, laid
 /// out so that a session can ask all of them a question at once.
 struct Few {
@@ -647,7 +670,7 @@ impl Tally {
     /// One person: `events` in bin order (any order within a bin), `clicks` in any order.
     fn person(&mut self, name: Key, events: &[u64], clicks: &mut [[u64; 2]]) {
         if clicks.len() > 1 {
-            clicks.sort_unstable_by(click_order);
+            sort_clicks(clicks);
         }
         let sliding = clicks.len() > SLIDING_MIN;
         let few = if sliding { Few { ts: [u32::MAX; FEW], campaign: [0; FEW + 1], earlier: [0; FEW] } } else { self.few(clicks) };
@@ -804,6 +827,46 @@ pub fn run<R: Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sort_clicks` leaves exactly what sorting by `click_order` does: clicks
+    /// crowded into a few instants and campaigns, copies among them, click IDs
+    /// of every kind of key.
+    #[test]
+    fn clicks_sort_as_click_order_says() {
+        let mut state = 61u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for round in 0..20_000 {
+            let count = (next() % 70) as usize;
+            let instants = 1 + next() % 1 + (round % 7) as u64 * (next() % 9);
+            let mut clicks: Vec<[u64; 2]> = Vec::new();
+            for number in 0..count {
+                if !clicks.is_empty() && next() % 6 == 0 {
+                    let copy = clicks[(next() % clicks.len() as u64) as usize];
+                    clicks.push(copy); // a copy of a click: the same in every word
+                    continue;
+                }
+                let ts = 1_000 + next() % instants;
+                let campaign = next() % 4;
+                // A click_id names one click (rules.md): each its own, in one of three kinds of key.
+                let id = match next() % 3 {
+                    0 => format!("k{number}"),
+                    1 => format!("k {number}"),
+                    _ => format!("K{number}"),
+                };
+                clicks.push([(ts << 32) | campaign, key::key_of(id.as_bytes())]);
+            }
+            let mut expected = clicks.clone();
+            expected.sort_unstable_by(click_order);
+            sort_clicks(&mut clicks);
+            assert_eq!(clicks, expected, "round {round}");
+        }
+    }
 
     #[test]
     fn few_click_bounds_match_unsigned_definition() {
