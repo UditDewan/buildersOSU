@@ -173,6 +173,13 @@ unsafe fn flatten<const N: usize>(mut bits: u64, base: u32, out: *mut u32) -> *m
     out.add(count)
 }
 
+/// By low nibble, the delimiter that has it (`\n` is 0x0a, `,` is 0x2c), 0xff
+/// for none: what `wide` uses too. `pshufb` with a byte as its own index gives
+/// the entry for the byte's low nibble, or 0 for a byte of 0x80 and over, and
+/// that equals the byte exactly when the byte is one of the two.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static DELIMITERS: [u8; 16] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, b'\n', 0xff, b',', 0xff, 0xff, 0xff];
+
 /// Bitmaps of the delimiters (`,` and `\n` together) and of `"` in the 64 bytes at `p`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
@@ -180,14 +187,16 @@ unsafe fn masks(p: *const u8) -> (u64, u64) {
     use std::arch::x86_64::*;
     let low = _mm256_loadu_si256(p as *const __m256i);
     let high = _mm256_loadu_si256(p.add(32) as *const __m256i);
-    let (comma, newline, quote) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+    let quote = _mm256_set1_epi8(b'"' as i8);
     let bits = |a: __m256i, b: __m256i| -> u64 {
         u64::from(_mm256_movemask_epi8(a) as u32) | (u64::from(_mm256_movemask_epi8(b) as u32) << 32)
     };
-    // Either delimiter: the two compares are joined before they leave the vector.
+    // Either delimiter by one lookup and one compare, where two compares and an
+    // OR were (BENCH.md, experiment 65, the list's item 15).
+    let table = _mm256_broadcastsi128_si256(_mm_loadu_si128(DELIMITERS.as_ptr() as *const __m128i));
     let delims = bits(
-        _mm256_or_si256(_mm256_cmpeq_epi8(low, comma), _mm256_cmpeq_epi8(low, newline)),
-        _mm256_or_si256(_mm256_cmpeq_epi8(high, comma), _mm256_cmpeq_epi8(high, newline)),
+        _mm256_cmpeq_epi8(_mm256_shuffle_epi8(table, low), low),
+        _mm256_cmpeq_epi8(_mm256_shuffle_epi8(table, high), high),
     );
     (delims, bits(_mm256_cmpeq_epi8(low, quote), _mm256_cmpeq_epi8(high, quote)))
 }
