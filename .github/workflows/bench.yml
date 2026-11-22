@@ -143,3 +143,4 @@ jobs:
           done
           start=$(date +%s%N); docker run --rm --network none shopping-sessions:latest true; end=$(date +%s%N)
           echo "docker run of 'true' in the image: $(( (end - start) / 1000000 )) ms"
+          echo "docker run of 'true' in the image: image size $(docker image inspect shopping-sessions:latest --format '{{.Size}}') bytes"
